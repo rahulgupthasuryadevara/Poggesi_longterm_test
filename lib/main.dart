@@ -119,7 +119,7 @@ class _MyAppState extends State<MyApp> {
       // Send idle also when PAUSED
       if ((!_testRunning || _testPaused) && isConnected && !_isPressed) {
         // If your controller needs periodic idle, uncomment:
-        ble.sendCommand("#GR=12503\n");
+        ble.sendCommand("#GR=10000\n");
       }
     });
   }
