@@ -1,7 +1,32 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart'; // ✅ Required for kDebugMode
 import 'package:flutter/material.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'bluetooth_helper.dart';
 import 'command_helper.dart';
+
+// ✅ NEW: Top-level callback for flutter_foreground_task
+// This runs in a separate isolate — keep it lightweight
+@pragma('vm:entry-point')
+void startCallback() {
+  FlutterForegroundTask.setTaskHandler(BleTaskHandler());
+}
+
+// ✅ NEW: Task handler — keeps the app process alive in background
+class BleTaskHandler extends TaskHandler {
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    // Nothing needed here — just keeping process alive
+  }
+
+  @override
+  void onRepeatEvent(DateTime timestamp) {
+    // Called every interval — can be used for heartbeat logging if needed
+  }
+
+  @override
+  Future<void> onDestroy(DateTime timestamp) async {}
+}
 
 void main() {
   runApp(const MyApp());
@@ -14,7 +39,7 @@ class MyApp extends StatefulWidget {
   State<MyApp> createState() => _MyAppState();
 }
 
-class _MyAppState extends State<MyApp> {
+class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   final ble = BluetoothHelper();
 
   bool isConnected = false;
@@ -27,13 +52,10 @@ class _MyAppState extends State<MyApp> {
   bool _isPressed = false;
 
   // Height info from controller (mm)
-  int currentHeight = 0; // #R10000=
+  int currentHeight = 0;
 
-  // -----------------------------
-  // NEW: MoveProgress (Register 12503)
-  // "1" = moving, "0" = not moving
-  // -----------------------------
-  int moveProgress = 0; // #R12503=
+  // MoveProgress (Register 12503) — "1" = moving, "0" = not moving
+  int moveProgress = 0;
   DateTime _lastMoveProgressUpdate = DateTime.fromMillisecondsSinceEpoch(0);
 
   // Height freshness
@@ -46,12 +68,9 @@ class _MyAppState extends State<MyApp> {
   int _waitDownSeconds = 10;
 
   // For UI text input
-  final TextEditingController _cyclesController =
-  TextEditingController(text: "3");
-  final TextEditingController _waitUpController =
-  TextEditingController(text: "10");
-  final TextEditingController _waitDownController =
-  TextEditingController(text: "10");
+  final TextEditingController _cyclesController = TextEditingController(text: "3");
+  final TextEditingController _waitUpController = TextEditingController(text: "10");
+  final TextEditingController _waitDownController = TextEditingController(text: "10");
 
   // Result
   int cyclesCompleted = 0;
@@ -60,9 +79,9 @@ class _MyAppState extends State<MyApp> {
   Timer? _idleTimer;
 
   // For resume logic
-  int _currentCycleIndex = 0; // 0-based index of cycle we are in
-  String _currentPhase = "idle"; // "up", "waitUp", "down", "waitDown", "idle"
-  double _phaseElapsedMs = 0; // used only for wait phases
+  int _currentCycleIndex = 0;
+  String _currentPhase = "idle";
+  double _phaseElapsedMs = 0;
 
   // Logs (optional)
   List<Map<String, dynamic>> currentLogs = [];
@@ -71,7 +90,7 @@ class _MyAppState extends State<MyApp> {
   // Safety timeout per direction
   final int _maxMoveMs = 60000;
 
-  // Poll rates (tune if needed)
+  // Poll rates
   final Duration _progressPollInterval = const Duration(milliseconds: 120);
   final Duration _keepAliveMoveInterval = const Duration(milliseconds: 700);
 
@@ -82,6 +101,26 @@ class _MyAppState extends State<MyApp> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    // ✅ NEW: Initialize the foreground task service
+    _initForegroundTask();
+
+    // ✅ NEW: Listen to connection drops from bluetooth_helper
+    ble.onConnectionStateChanged = (bool connected) {
+      if (mounted) {
+        setState(() => isConnected = connected);
+        if (!connected) {
+          // Connection dropped — stop idle timer until reconnected
+          _stopIdleTimer();
+          if (kDebugMode) print("UI: Connection lost, waiting for reconnect...");
+        } else {
+          // Reconnected!
+          _startIdleTimer();
+          if (kDebugMode) print("UI: Reconnected!");
+        }
+      }
+    };
 
     ble.onDataReceived = (String msg) {
       msg = msg.trim();
@@ -91,17 +130,55 @@ class _MyAppState extends State<MyApp> {
         if (val != null) {
           moveProgress = val;
           _lastMoveProgressUpdate = DateTime.now();
-          setState(() {});
+          if (mounted) setState(() {});
         }
       }
-
-      // If later you enable R11011:
-      // else if (msg.startsWith("#R11011=")) { ... }
     };
+  }
+
+  // ✅ NEW: Setup flutter_foreground_task
+  void _initForegroundTask() {
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        channelId: 'ble_channel',
+        channelName: 'BLE Connection Service',
+        channelDescription: 'Keeps BLE connection alive in background',
+        channelImportance: NotificationChannelImportance.LOW,
+        priority: NotificationPriority.LOW,
+      ),
+      iosNotificationOptions: const IOSNotificationOptions(
+        showNotification: false,
+        playSound: false,
+      ),
+      foregroundTaskOptions: ForegroundTaskOptions(
+        eventAction: ForegroundTaskEventAction.repeat(5000), // heartbeat every 5s
+        autoRunOnBoot: false,
+        allowWakeLock: true, // ✅ Prevents CPU from sleeping — critical for BLE
+        allowWifiLock: false,
+      ),
+    );
+  }
+
+  // ✅ NEW: Start the foreground task (shows persistent notification, keeps process alive)
+  Future<void> _startForegroundTask() async {
+    if (await FlutterForegroundTask.isRunningService) return;
+
+    await FlutterForegroundTask.startService(
+      serviceId: 256,
+      notificationTitle: 'LMC BLE Active',
+      notificationText: 'Maintaining BLE connection...',
+      callback: startCallback,
+    );
+  }
+
+  // ✅ NEW: Stop the foreground task when disconnected
+  Future<void> _stopForegroundTask() async {
+    await FlutterForegroundTask.stopService();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _cyclesController.dispose();
     _waitUpController.dispose();
     _waitDownController.dispose();
@@ -109,16 +186,34 @@ class _MyAppState extends State<MyApp> {
     super.dispose();
   }
 
+  // ✅ NEW: Handle app going to background / coming to foreground
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+
+    if (state == AppLifecycleState.paused) {
+      // App going to background — foreground service keeps process alive
+      if (kDebugMode) print("App backgrounded — foreground service keeping BLE alive");
+    } else if (state == AppLifecycleState.resumed) {
+      // App came back to foreground — re-sync connection state
+      if (kDebugMode) print("App foregrounded — re-checking BLE state");
+      ble.isActuallyConnected.then((connected) {
+        if (mounted) setState(() => isConnected = connected);
+        if (connected && _idleTimer == null) {
+          _startIdleTimer();
+        }
+      });
+    }
+  }
+
   // ---------------------------------------------------------------------------
-  // Keep-alive
+  // Keep-alive idle timer
   // ---------------------------------------------------------------------------
 
   void _startIdleTimer() {
     _idleTimer?.cancel();
     _idleTimer = Timer.periodic(const Duration(milliseconds: 380), (Timer t) {
-      // Send idle also when PAUSED
       if ((!_testRunning || _testPaused) && isConnected && !_isPressed) {
-        // If your controller needs periodic idle, uncomment:
         ble.sendCommand("#GR=10000\n");
       }
     });
@@ -126,30 +221,11 @@ class _MyAppState extends State<MyApp> {
 
   void _stopIdleTimer() {
     _idleTimer?.cancel();
+    _idleTimer = null;
   }
 
   // ---------------------------------------------------------------------------
-  // Poll height (for UI freshness / optional)
-  // ---------------------------------------------------------------------------
-
-  /*Future<int?> _pollHeight() async {
-    if (!isConnected) return null;
-
-    final beforeStamp = _lastHeightUpdate;
-
-    await ble.sendCommand("#GR=10000\n");
-    await Future.delayed(const Duration(milliseconds: 80));
-
-    if (_lastHeightUpdate != beforeStamp) return currentHeight;
-
-    await Future.delayed(const Duration(milliseconds: 80));
-    if (_lastHeightUpdate != beforeStamp) return currentHeight;
-    return null;
-  }*/
-
-  // ---------------------------------------------------------------------------
   // Poll MoveProgress (Register 12503)
-  // returns 0/1 when fresh, null if no fresh update
   // ---------------------------------------------------------------------------
 
   Future<int?> _pollMoveProgress() async {
@@ -185,14 +261,7 @@ class _MyAppState extends State<MyApp> {
   }
 
   // ---------------------------------------------------------------------------
-  // MOVE USING MoveProgress (12503)
-  // Logic:
-  //  - start moving (send UP/DOWN)
-  //  - poll 12503; while it is "1" keep waiting
-  //  - as soon as it becomes "0" => motor stopped => go idle + return
-  // Notes:
-  //  - we also "refresh" move command every _keepAliveMoveInterval in case
-  //    your controller requires periodic commands to keep moving.
+  // Move until controller stops
   // ---------------------------------------------------------------------------
 
   Future<void> _moveUntilControllerStops({required bool goingUp}) async {
@@ -204,36 +273,21 @@ class _MyAppState extends State<MyApp> {
     final start = DateTime.now();
     DateTime lastKeepAlive = DateTime.fromMillisecondsSinceEpoch(0);
 
-    // Kick movement once
     await ble.sendCommand(goingUp ? Commands.up : Commands.down);
-
-    // Optional: prime a progress read so we have a baseline
     await _pollMoveProgress();
 
     while (_testRunning && !_testPaused) {
       final elapsed = DateTime.now().difference(start).inMilliseconds;
 
-      // safety timeout
-      if (elapsed > _maxMoveMs) {
-        break;
-      }
+      if (elapsed > _maxMoveMs) break;
 
-      // keep-alive move command (only if needed)
       if (DateTime.now().difference(lastKeepAlive) >= _keepAliveMoveInterval) {
         await ble.sendCommand(goingUp ? Commands.up : Commands.down);
         lastKeepAlive = DateTime.now();
       }
 
-      // poll move progress
       final p = await _pollMoveProgress();
-      if (p != null && p == 0) {
-        // controller says motor is not moving => reached end/stop
-        break;
-      }
-
-      // optional: poll height occasionally so UI updates while moving
-      // (you can remove this if you don't want extra traffic)
-      //await _pollHeight();
+      if (p != null && p == 0) break;
 
       await Future.delayed(_progressPollInterval);
     }
@@ -242,7 +296,7 @@ class _MyAppState extends State<MyApp> {
   }
 
   // ---------------------------------------------------------------------------
-  // Wait at end (precise)
+  // Wait at end
   // ---------------------------------------------------------------------------
 
   Future<void> _waitAtEnd({required bool atTop}) async {
@@ -254,7 +308,6 @@ class _MyAppState extends State<MyApp> {
       setState(() {});
     }
 
-    // Send idle once when entering wait
     await ble.sendCommand(Commands.idle);
 
     final start = DateTime.now();
@@ -266,11 +319,8 @@ class _MyAppState extends State<MyApp> {
 
       if (elapsed >= totalMs) break;
 
-      // ✅ Keep-alive: force BLE traffic + response
       if (DateTime.now().difference(lastPing) >= _waitKeepAliveInterval) {
-        await ble.sendCommand("#GR=12503\n"); // safe read (response expected)
-        // If your controller requires, you can also send idle:
-        // await ble.sendCommand(Commands.idle);
+        await ble.sendCommand("#GR=12503\n");
         lastPing = DateTime.now();
       }
 
@@ -281,8 +331,6 @@ class _MyAppState extends State<MyApp> {
     _phaseElapsedMs = 0;
   }
 
-
-
   // ---------------------------------------------------------------------------
   // Start / Resume test
   // ---------------------------------------------------------------------------
@@ -290,18 +338,13 @@ class _MyAppState extends State<MyApp> {
   Future<void> _startTest() async {
     if (!isConnected) return;
 
-    // Resume
     if (_testRunning && _testPaused) {
       _testPaused = false;
       _stopIdleTimer();
       setState(() {});
-    }
-    // Already running
-    else if (_testRunning && !_testPaused) {
+    } else if (_testRunning && !_testPaused) {
       return;
-    }
-    // New test
-    else {
+    } else {
       _setValues();
       currentLogs.clear();
 
@@ -316,44 +359,36 @@ class _MyAppState extends State<MyApp> {
       setState(() {});
     }
 
-    // MAIN LOOP
     while (_testRunning && _currentCycleIndex < _cycles) {
       if (_testPaused) {
         _startIdleTimer();
         return;
       }
 
-      // ------------------- UP UNTIL CONTROLLER STOPS -------------------
       if (_currentPhase == "up") {
         await _moveUntilControllerStops(goingUp: true);
         if (!_testRunning || _testPaused) break;
-
         _currentPhase = "waitUp";
         _phaseElapsedMs = 0;
         setState(() {});
       }
 
-      // ------------------- WAIT AT TOP -------------------
       if (_currentPhase == "waitUp") {
         await _waitAtEnd(atTop: true);
         if (!_testRunning || _testPaused) break;
-
         _currentPhase = "down";
         _phaseElapsedMs = 0;
         setState(() {});
       }
 
-      // ------------------- DOWN UNTIL CONTROLLER STOPS -------------------
       if (_currentPhase == "down") {
         await _moveUntilControllerStops(goingUp: false);
         if (!_testRunning || _testPaused) break;
-
         _currentPhase = "waitDown";
         _phaseElapsedMs = 0;
         setState(() {});
       }
 
-      // ------------------- WAIT AT BOTTOM -------------------
       if (_currentPhase == "waitDown") {
         await _waitAtEnd(atTop: false);
         if (!_testRunning || _testPaused) break;
@@ -373,7 +408,6 @@ class _MyAppState extends State<MyApp> {
       return;
     }
 
-    // Finished
     _testRunning = false;
     _testPaused = false;
     _currentPhase = "idle";
@@ -387,7 +421,6 @@ class _MyAppState extends State<MyApp> {
 
   Future<void> _pauseTest() async {
     if (!_testRunning || _testPaused) return;
-
     _testPaused = true;
     await ble.sendCommand(Commands.idle);
     _startIdleTimer();
@@ -441,7 +474,11 @@ class _MyAppState extends State<MyApp> {
     if (isConnected) {
       await ble.disconnect();
       _stopIdleTimer();
+      // ✅ Stop foreground task when user disconnects
+      await _stopForegroundTask();
     } else {
+      // ✅ Start foreground task BEFORE connecting — keeps process alive
+      await _startForegroundTask();
       await ble.scanAndConnect();
     }
 
@@ -450,9 +487,11 @@ class _MyAppState extends State<MyApp> {
 
     if (isConnected) {
       _startIdleTimer();
-      // get one height read + one move progress read
       await ble.sendCommand("#GR=10000\n");
       await ble.sendCommand("#GR=12503\n");
+    } else {
+      // If connection failed, stop the foreground task
+      await _stopForegroundTask();
     }
   }
 
@@ -462,9 +501,6 @@ class _MyAppState extends State<MyApp> {
 
   @override
   Widget build(BuildContext context) {
-    final textStyleLabel =
-    const TextStyle(fontSize: 17, fontWeight: FontWeight.bold);
-
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       home: Builder(
@@ -489,60 +525,48 @@ class _MyAppState extends State<MyApp> {
                 padding: EdgeInsets.zero,
                 children: [
                   DrawerHeader(
-                    decoration:
-                    const BoxDecoration(color: Color(0xFFE96A1E)),
+                    decoration: const BoxDecoration(color: Color(0xFFE96A1E)),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: const [
-                        Text(
-                          'Hello, Rahul',
-                          style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 24,
-                              fontWeight: FontWeight.bold),
-                        ),
-                        Text(
-                          'Settings',
-                          style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 22,
-                              fontWeight: FontWeight.w500),
-                        ),
+                        Text('Hello, Rahul',
+                            style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 24,
+                                fontWeight: FontWeight.bold)),
+                        Text('Settings',
+                            style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 22,
+                                fontWeight: FontWeight.w500)),
                       ],
                     ),
                   ),
                   const ListTile(
                     leading: Icon(Icons.language, color: Colors.black54),
                     title: Text('Language',
-                        style: TextStyle(
-                            fontSize: 20, fontWeight: FontWeight.w600)),
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
                   ),
                   const ListTile(
                     leading: Icon(Icons.dark_mode, color: Colors.black54),
                     title: Text('Dark mode',
-                        style: TextStyle(
-                            fontSize: 20, fontWeight: FontWeight.w600)),
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
                   ),
                   const ListTile(
                     leading: Icon(Icons.logout, color: Colors.black54),
                     title: Text('Logout',
-                        style: TextStyle(
-                            fontSize: 20, fontWeight: FontWeight.w600)),
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
                   ),
                   const ListTile(
                     leading: Icon(Icons.info_outline, color: Colors.black54),
                     title: Text('About',
-                        style: TextStyle(
-                            fontSize: 20, fontWeight: FontWeight.w600)),
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
                   ),
                   ListTile(
                     leading: const Icon(Icons.list, color: Colors.black54),
-                    title: const Text(
-                      'Logs',
-                      style:
-                      TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
-                    ),
+                    title: const Text('Logs',
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
                   ),
                 ],
               ),
@@ -573,7 +597,6 @@ class _MyAppState extends State<MyApp> {
                   // INPUTS + RESULTS
                   Row(
                     children: [
-                      // INPUTS CONTAINER
                       Container(
                         height: 210,
                         width: 180,
@@ -599,18 +622,15 @@ class _MyAppState extends State<MyApp> {
                                       color: Colors.grey)),
                             ),
                             const SizedBox(height: 6),
-                            Text(
-                              "MoveProgress: $moveProgress",
-                              style: const TextStyle(
-                                  fontSize: 14, fontWeight: FontWeight.w600),
-                            ),
+                            Text("MoveProgress: $moveProgress",
+                                style: const TextStyle(
+                                    fontSize: 14, fontWeight: FontWeight.w600)),
                             const SizedBox(height: 10),
                             Row(
                               children: [
                                 const Text("Cycles:",
                                     style: TextStyle(
-                                        fontSize: 13,
-                                        fontWeight: FontWeight.bold)),
+                                        fontSize: 13, fontWeight: FontWeight.bold)),
                                 const SizedBox(width: 3),
                                 SizedBox(
                                   width: 70,
@@ -620,8 +640,8 @@ class _MyAppState extends State<MyApp> {
                                     keyboardType: TextInputType.number,
                                     decoration: const InputDecoration(
                                         isDense: true,
-                                        contentPadding: EdgeInsets.symmetric(
-                                            horizontal: 6),
+                                        contentPadding:
+                                        EdgeInsets.symmetric(horizontal: 6),
                                         border: OutlineInputBorder()),
                                   ),
                                 ),
@@ -632,8 +652,7 @@ class _MyAppState extends State<MyApp> {
                               children: [
                                 const Text("Wait up:",
                                     style: TextStyle(
-                                        fontSize: 13,
-                                        fontWeight: FontWeight.bold)),
+                                        fontSize: 13, fontWeight: FontWeight.bold)),
                                 const SizedBox(width: 3),
                                 SizedBox(
                                   width: 90,
@@ -644,8 +663,8 @@ class _MyAppState extends State<MyApp> {
                                     decoration: const InputDecoration(
                                         suffixText: "s",
                                         isDense: true,
-                                        contentPadding: EdgeInsets.symmetric(
-                                            horizontal: 6),
+                                        contentPadding:
+                                        EdgeInsets.symmetric(horizontal: 6),
                                         border: OutlineInputBorder()),
                                   ),
                                 ),
@@ -656,8 +675,7 @@ class _MyAppState extends State<MyApp> {
                               children: [
                                 const Text("Wait down:",
                                     style: TextStyle(
-                                        fontSize: 13,
-                                        fontWeight: FontWeight.bold)),
+                                        fontSize: 13, fontWeight: FontWeight.bold)),
                                 const SizedBox(width: 3),
                                 SizedBox(
                                   width: 90,
@@ -668,8 +686,8 @@ class _MyAppState extends State<MyApp> {
                                     decoration: const InputDecoration(
                                         suffixText: "s",
                                         isDense: true,
-                                        contentPadding: EdgeInsets.symmetric(
-                                            horizontal: 6),
+                                        contentPadding:
+                                        EdgeInsets.symmetric(horizontal: 6),
                                         border: OutlineInputBorder()),
                                   ),
                                 ),
@@ -681,7 +699,6 @@ class _MyAppState extends State<MyApp> {
 
                       const SizedBox(width: 5),
 
-                      // RESULTS CONTAINER
                       Container(
                         height: 210,
                         width: 160,
@@ -710,19 +727,15 @@ class _MyAppState extends State<MyApp> {
                                     fontWeight: FontWeight.bold,
                                     color: Color(0xFFE96A1E))),
                             const SizedBox(height: 5),
-                            Text(
-                              cyclesCompleted.toString(),
-                              style: const TextStyle(
-                                  fontSize: 30,
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.green),
-                            ),
+                            Text(cyclesCompleted.toString(),
+                                style: const TextStyle(
+                                    fontSize: 30,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.green)),
                             const SizedBox(height: 8),
-                            Text(
-                              "Phase: $_currentPhase",
-                              style: const TextStyle(
-                                  fontSize: 12, fontWeight: FontWeight.w600),
-                            ),
+                            Text("Phase: $_currentPhase",
+                                style: const TextStyle(
+                                    fontSize: 12, fontWeight: FontWeight.w600)),
                           ],
                         ),
                       ),
@@ -734,7 +747,6 @@ class _MyAppState extends State<MyApp> {
                   // CONTROLS + TEST BUTTONS
                   Row(
                     children: [
-                      // MANUAL CONTROLS
                       Container(
                         height: 170,
                         width: 150,
@@ -758,8 +770,6 @@ class _MyAppState extends State<MyApp> {
                                     fontWeight: FontWeight.bold,
                                     color: Colors.grey)),
                             const SizedBox(height: 5),
-
-                            // UP Button
                             GestureDetector(
                               onTapDown: (_) =>
                                   _startContinuousCommand(Commands.up),
@@ -782,8 +792,7 @@ class _MyAppState extends State<MyApp> {
                                 child: const Row(
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
-                                    Icon(Icons.arrow_upward,
-                                        color: Colors.white),
+                                    Icon(Icons.arrow_upward, color: Colors.white),
                                     SizedBox(width: 10),
                                     Text("UP",
                                         style: TextStyle(
@@ -794,10 +803,7 @@ class _MyAppState extends State<MyApp> {
                                 ),
                               ),
                             ),
-
                             const SizedBox(height: 10),
-
-                            // DOWN Button
                             GestureDetector(
                               onTapDown: (_) =>
                                   _startContinuousCommand(Commands.down),
@@ -838,7 +844,6 @@ class _MyAppState extends State<MyApp> {
 
                       const SizedBox(width: 15),
 
-                      // TEST BUTTONS
                       Column(
                         children: [
                           ElevatedButton.icon(
@@ -849,17 +854,14 @@ class _MyAppState extends State<MyApp> {
                             label: Text(
                               _testPaused ? "Resume Test" : "Start Test",
                               style: const TextStyle(
-                                fontSize: 15,
-                                fontWeight: FontWeight.bold,
-                              ),
+                                  fontSize: 15, fontWeight: FontWeight.bold),
                             ),
                             style: ElevatedButton.styleFrom(
                               backgroundColor: const Color(0xFFE96A1E),
                               foregroundColor: Colors.white,
                               minimumSize: const Size(10, 40),
                               shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                              ),
+                                  borderRadius: BorderRadius.circular(8)),
                             ),
                           ),
                           const SizedBox(height: 10),
@@ -868,8 +870,7 @@ class _MyAppState extends State<MyApp> {
                             icon: const Icon(Icons.pause),
                             label: const Text("Pause Test",
                                 style: TextStyle(
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.bold)),
+                                    fontSize: 15, fontWeight: FontWeight.bold)),
                             style: ElevatedButton.styleFrom(
                                 backgroundColor: Colors.amber,
                                 foregroundColor: Colors.white,
@@ -883,8 +884,7 @@ class _MyAppState extends State<MyApp> {
                             icon: const Icon(Icons.stop),
                             label: const Text("Stop Test",
                                 style: TextStyle(
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.bold)),
+                                    fontSize: 15, fontWeight: FontWeight.bold)),
                             style: ElevatedButton.styleFrom(
                                 backgroundColor: const Color(0xFFE96A1E),
                                 foregroundColor: Colors.white,
@@ -899,11 +899,11 @@ class _MyAppState extends State<MyApp> {
 
                   const SizedBox(height: 20),
 
-                  // CONNECT BUTTON
                   ElevatedButton.icon(
                     onPressed: scanAndConnect,
-                    icon: Icon(
-                        isConnected ? Icons.bluetooth_disabled : Icons.bluetooth),
+                    icon: Icon(isConnected
+                        ? Icons.bluetooth_disabled
+                        : Icons.bluetooth),
                     label: Text(isConnected ? "Disconnect" : "Connect",
                         style: const TextStyle(fontSize: 20)),
                     style: ElevatedButton.styleFrom(

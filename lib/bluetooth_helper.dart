@@ -15,8 +15,20 @@ class BluetoothHelper {
 
   Timer? _keepAliveTimer;
 
+  // ✅ NEW: Connection state subscription — monitors drops and triggers reconnect
+  StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
+
+  // ✅ NEW: Flag to prevent multiple simultaneous reconnect attempts
+  bool _isReconnecting = false;
+
+  // ✅ NEW: Flag to know if user intentionally disconnected (don't auto-reconnect)
+  bool _userDisconnected = false;
+
   // Callback for incoming messages (used by main.dart)
   void Function(String msg)? onDataReceived;
+
+  // ✅ NEW: Callback so main.dart knows when connection drops/restores
+  void Function(bool connected)? onConnectionStateChanged;
 
   Future<bool> get isActuallyConnected async {
     if (device == null) return false;
@@ -29,9 +41,7 @@ class BluetoothHelper {
 
   void enqueueCommand(String cmd) {
     commandQueue.add(cmd);
-    if (kDebugMode) {
-      print("Command enqueued. Queue length: ${commandQueue.length}");
-    }
+    if (kDebugMode) print("Command enqueued. Queue length: ${commandQueue.length}");
     _processQueue();
   }
 
@@ -40,18 +50,15 @@ class BluetoothHelper {
     if (await isActuallyConnected == false) return;
 
     isWriting = true;
-
     final nextCmd = commandQueue.removeFirst();
     try {
       final bytes = nextCmd.codeUnits;
       await writeChar!.write(bytes, withoutResponse: true);
       if (kDebugMode) print("Queued sent: $nextCmd");
-      // If you want to use #OK for flow control, call onOkFromDevice()
-      // when you see "#OK" in notifications.
     } catch (e) {
       if (kDebugMode) print("Error during queued write: $e");
       isWriting = false;
-      _processQueue(); // Try next command
+      _processQueue();
     }
   }
 
@@ -60,15 +67,15 @@ class BluetoothHelper {
     _processQueue();
   }
 
+  // ✅ FIXED: Keep-alive timer now enabled (was commented out before)
   void _startKeepAliveTimer() {
     _keepAliveTimer?.cancel();
-    _keepAliveTimer =
-        Timer.periodic(const Duration(seconds: 4), (timer) async {
-          if (commandQueue.isEmpty && !isWriting && await isActuallyConnected) {
-            if (kDebugMode) print("Sending alive Command");
-            enqueueCommand("#CMD idle 0\n");
-          }
-        });
+    _keepAliveTimer = Timer.periodic(const Duration(seconds: 4), (timer) async {
+      if (commandQueue.isEmpty && !isWriting && await isActuallyConnected) {
+        if (kDebugMode) print("Sending keep-alive");
+        enqueueCommand("#CMD idle 0\n");
+      }
+    });
   }
 
   void _stopKeepAliveTimer() {
@@ -91,13 +98,9 @@ class BluetoothHelper {
   }
 
   Future<void> flushAndSend(String stopCmd) async {
-    if (kDebugMode) {
-      print("Flushing queue. Length: ${commandQueue.length}");
-    }
+    if (kDebugMode) print("Flushing queue. Length: ${commandQueue.length}");
     commandQueue.clear();
-
     isWriting = false;
-
     try {
       final data = stopCmd.codeUnits;
       await writeChar!.write(data, withoutResponse: true);
@@ -112,7 +115,12 @@ class BluetoothHelper {
   }
 
   Future<void> disconnect() async {
-    //_stopKeepAliveTimer();
+    // ✅ Mark as intentional disconnect — prevents auto-reconnect
+    _userDisconnected = true;
+    _stopKeepAliveTimer();
+    _connectionStateSubscription?.cancel();
+    _connectionStateSubscription = null;
+
     if (device != null) {
       try {
         await device!.disconnect();
@@ -124,6 +132,87 @@ class BluetoothHelper {
         writeChar = null;
         notifyChar = null;
       }
+    }
+  }
+
+  // ✅ NEW: Monitor connection state and auto-reconnect when dropped
+  void _listenToConnectionState() {
+    _connectionStateSubscription?.cancel();
+    _connectionStateSubscription = device!.connectionState.listen((state) async {
+      if (kDebugMode) print("BLE connection state: $state");
+
+      if (state == BluetoothConnectionState.disconnected) {
+        writeChar = null;
+        notifyChar = null;
+        onConnectionStateChanged?.call(false);
+
+        // Don't reconnect if user intentionally disconnected
+        if (_userDisconnected || _isReconnecting) return;
+
+        if (kDebugMode) print("Connection dropped! Attempting auto-reconnect...");
+        await _autoReconnect();
+      } else if (state == BluetoothConnectionState.connected) {
+        onConnectionStateChanged?.call(true);
+      }
+    });
+  }
+
+  // ✅ NEW: Auto-reconnect with retry logic
+  Future<void> _autoReconnect() async {
+    if (_isReconnecting || device == null) return;
+    _isReconnecting = true;
+
+    int attempts = 0;
+    const maxAttempts = 5;
+
+    while (attempts < maxAttempts && !_userDisconnected) {
+      attempts++;
+      if (kDebugMode) print("Reconnect attempt $attempts/$maxAttempts...");
+
+      try {
+        // Wait a bit before retrying
+        await Future.delayed(Duration(seconds: attempts * 2));
+
+        await device!.connect(autoConnect: false, mtu: 23);
+
+        // Re-discover services after reconnect
+        await _discoverAndSubscribe();
+
+        if (kDebugMode) print("Reconnected successfully!");
+        _isReconnecting = false;
+        return;
+      } catch (e) {
+        if (kDebugMode) print("Reconnect attempt $attempts failed: $e");
+      }
+    }
+
+    if (kDebugMode) print("All reconnect attempts failed.");
+    _isReconnecting = false;
+    device = null;
+  }
+
+  // ✅ NEW: Extracted service discovery into its own method (used by both connect and reconnect)
+  Future<void> _discoverAndSubscribe() async {
+    final services = await device!.discoverServices();
+    for (final s in services) {
+      if (s.uuid == serviceUuid) {
+        for (final c in s.characteristics) {
+          if (c.uuid == writeUuid) writeChar = c;
+          if (c.uuid == notifyUuid) notifyChar = c;
+        }
+      }
+    }
+
+    if (notifyChar != null && notifyChar!.properties.notify) {
+      if (kDebugMode) print("Subscribing to notifications...");
+      await notifyChar!.setNotifyValue(true);
+      notifyChar!.onValueReceived.listen((bytes) {
+        final msg = String.fromCharCodes(bytes);
+        if (kDebugMode) print("Device says: $msg");
+        if (onDataReceived != null) {
+          onDataReceived!(msg);
+        }
+      });
     }
   }
 
@@ -150,14 +239,20 @@ class BluetoothHelper {
     }
 
     if (target == null) {
-      if (kDebugMode) print("Umbrella not found nearby.");
+      if (kDebugMode) print("Device not found nearby.");
       return;
     }
 
     device = target.device;
+    // ✅ Reset the intentional disconnect flag
+    _userDisconnected = false;
+    _isReconnecting = false;
+
     if (kDebugMode) print("Connecting to ${device!.platformName}...");
 
     try {
+      // ✅ CHANGED: autoConnect: false for initial connect (faster),
+      // auto-reconnect is handled by our own _autoReconnect() logic
       await device!.connect(autoConnect: false, mtu: 23);
     } catch (e) {
       if (kDebugMode) print("Connection failed: $e");
@@ -166,36 +261,13 @@ class BluetoothHelper {
 
     if (kDebugMode) print("Connected to ${device!.platformName}");
 
-    final services = await device!.discoverServices();
-    for (final s in services) {
-      if (s.uuid == serviceUuid) {
-        for (final c in s.characteristics) {
-          if (c.uuid == writeUuid) writeChar = c;
-          if (c.uuid == notifyUuid) notifyChar = c;
-        }
-      }
-    }
+    // ✅ Start monitoring connection state BEFORE anything else
+    _listenToConnectionState();
 
-    if (notifyChar != null && notifyChar!.properties.notify) {
-      if (kDebugMode) print("Listening for notifications...");
-      await notifyChar!.setNotifyValue(true);
-      notifyChar!.onValueReceived.listen((bytes) {
-        final msg = String.fromCharCodes(bytes);
-        if (kDebugMode) print("Device says: $msg");
+    // Discover services and subscribe to notifications
+    await _discoverAndSubscribe();
 
-        // Forward to app-level handler (main.dart)
-        if (onDataReceived != null) {
-          onDataReceived!(msg);
-        }
-
-        // If you later use the queue + #OK handshake:
-        // if (msg.contains("#OK")) {
-        //   onOkFromDevice();
-        // }
-      });
-    }
-
-    // Optionally start keep-alive
-    //_startKeepAliveTimer();
+    // ✅ Start keep-alive timer (was commented out before — this is critical!)
+    _startKeepAliveTimer();
   }
 }
