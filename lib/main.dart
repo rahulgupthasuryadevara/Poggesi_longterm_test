@@ -38,6 +38,7 @@ class _MyAppState extends State<MyApp> {
 
   // Height freshness
   DateTime _lastHeightUpdate = DateTime.fromMillisecondsSinceEpoch(0);
+  final Duration _waitKeepAliveInterval = const Duration(seconds: 2);
 
   // Test configuration (defaults)
   int _cycles = 3;
@@ -85,14 +86,7 @@ class _MyAppState extends State<MyApp> {
     ble.onDataReceived = (String msg) {
       msg = msg.trim();
 
-      if (msg.startsWith("#R10000=")) {
-        final val = int.tryParse(msg.split("=").last);
-        if (val != null) {
-          currentHeight = val;
-          _lastHeightUpdate = DateTime.now();
-          setState(() {});
-        }
-      } else if (msg.startsWith("#R12503=")) {
+      if (msg.startsWith("#R12503=")) {
         final val = int.tryParse(msg.split("=").last);
         if (val != null) {
           moveProgress = val;
@@ -125,7 +119,7 @@ class _MyAppState extends State<MyApp> {
       // Send idle also when PAUSED
       if ((!_testRunning || _testPaused) && isConnected && !_isPressed) {
         // If your controller needs periodic idle, uncomment:
-        // ble.sendCommand(Commands.idle);
+        ble.sendCommand("#GR=12503\n");
       }
     });
   }
@@ -138,7 +132,7 @@ class _MyAppState extends State<MyApp> {
   // Poll height (for UI freshness / optional)
   // ---------------------------------------------------------------------------
 
-  Future<int?> _pollHeight() async {
+  /*Future<int?> _pollHeight() async {
     if (!isConnected) return null;
 
     final beforeStamp = _lastHeightUpdate;
@@ -151,7 +145,7 @@ class _MyAppState extends State<MyApp> {
     await Future.delayed(const Duration(milliseconds: 80));
     if (_lastHeightUpdate != beforeStamp) return currentHeight;
     return null;
-  }
+  }*/
 
   // ---------------------------------------------------------------------------
   // Poll MoveProgress (Register 12503)
@@ -239,7 +233,7 @@ class _MyAppState extends State<MyApp> {
 
       // optional: poll height occasionally so UI updates while moving
       // (you can remove this if you don't want extra traffic)
-      await _pollHeight();
+      //await _pollHeight();
 
       await Future.delayed(_progressPollInterval);
     }
@@ -260,19 +254,34 @@ class _MyAppState extends State<MyApp> {
       setState(() {});
     }
 
+    // Send idle once when entering wait
     await ble.sendCommand(Commands.idle);
 
     final start = DateTime.now();
+    DateTime lastPing = DateTime.now().subtract(_waitKeepAliveInterval);
+
     while (_testRunning && !_testPaused) {
       final elapsed = DateTime.now().difference(start).inMilliseconds;
       _phaseElapsedMs = elapsed.toDouble();
+
       if (elapsed >= totalMs) break;
-      await Future.delayed(const Duration(milliseconds: 50));
+
+      // ✅ Keep-alive: force BLE traffic + response
+      if (DateTime.now().difference(lastPing) >= _waitKeepAliveInterval) {
+        await ble.sendCommand("#GR=12503\n"); // safe read (response expected)
+        // If your controller requires, you can also send idle:
+        // await ble.sendCommand(Commands.idle);
+        lastPing = DateTime.now();
+      }
+
+      await Future.delayed(const Duration(milliseconds: 100));
     }
 
     if (_testPaused) return;
     _phaseElapsedMs = 0;
   }
+
+
 
   // ---------------------------------------------------------------------------
   // Start / Resume test
@@ -588,11 +597,6 @@ class _MyAppState extends State<MyApp> {
                                       fontSize: 18,
                                       fontWeight: FontWeight.bold,
                                       color: Colors.grey)),
-                            ),
-                            const SizedBox(height: 6),
-                            Text(
-                              "CurrHeight: ${currentHeight == 0 ? "_____" : "$currentHeight mm"}",
-                              style: textStyleLabel,
                             ),
                             const SizedBox(height: 6),
                             Text(
