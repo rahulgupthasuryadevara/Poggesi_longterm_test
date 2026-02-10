@@ -261,7 +261,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   }
 
   // ---------------------------------------------------------------------------
-  // Move until controller stops
+  // Move with 6-second mandatory minimum, then stop when moveProgress = 0
   // ---------------------------------------------------------------------------
 
   Future<void> _moveUntilControllerStops({required bool goingUp}) async {
@@ -272,22 +272,31 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
     final start = DateTime.now();
     DateTime lastKeepAlive = DateTime.fromMillisecondsSinceEpoch(0);
+    const mandatoryMoveMs = 6000; // Motor runs AT LEAST 6 seconds no matter what
 
-    await ble.sendCommand(goingUp ? Commands.up : Commands.down);
-    await _pollMoveProgress();
 
     while (_testRunning && !_testPaused) {
       final elapsed = DateTime.now().difference(start).inMilliseconds;
 
-      if (elapsed > _maxMoveMs) break;
+      // Safety timeout
+      if (elapsed > _maxMoveMs) {
+        if (kDebugMode) print("Safety timeout — stopping");
+        break;
+      }
 
+      // Send keep-alive move command periodically
       if (DateTime.now().difference(lastKeepAlive) >= _keepAliveMoveInterval) {
         await ble.sendCommand(goingUp ? Commands.up : Commands.down);
         lastKeepAlive = DateTime.now();
       }
 
-      final p = await _pollMoveProgress();
-      if (p != null && p == 0) break;
+      // Only check moveProgress AFTER mandatory 6 seconds have passed
+      if (elapsed >= mandatoryMoveMs) {
+        final p = await _pollMoveProgress();
+        if (p != null && p == 0) {
+          break;
+        }
+      }
 
       await Future.delayed(_progressPollInterval);
     }
