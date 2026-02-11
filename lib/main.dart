@@ -1,18 +1,18 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart'; // ✅ Required for kDebugMode
+import 'package:flutter/foundation.dart'; // Required for kDebugMode
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'bluetooth_helper.dart';
 import 'command_helper.dart';
 
-// ✅ NEW: Top-level callback for flutter_foreground_task
+//  NEW: Top-level callback for flutter_foreground_task
 // This runs in a separate isolate — keep it lightweight
 @pragma('vm:entry-point')
 void startCallback() {
   FlutterForegroundTask.setTaskHandler(BleTaskHandler());
 }
 
-// ✅ NEW: Task handler — keeps the app process alive in background
+//  NEW: Task handler — keeps the app process alive in background
 class BleTaskHandler extends TaskHandler {
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
@@ -103,22 +103,29 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    // ✅ NEW: Initialize the foreground task service
+    //  NEW: Initialize the foreground task service
     _initForegroundTask();
 
-    // ✅ NEW: Listen to connection drops from bluetooth_helper
+    //  Listen to connection drops/restores from bluetooth_helper
     ble.onConnectionStateChanged = (bool connected) {
-      if (mounted) {
-        setState(() => isConnected = connected);
-        if (!connected) {
-          // Connection dropped — stop idle timer until reconnected
-          _stopIdleTimer();
-          if (kDebugMode) print("UI: Connection lost, waiting for reconnect...");
-        } else {
-          // Reconnected!
-          _startIdleTimer();
-          if (kDebugMode) print("UI: Reconnected!");
+      if (!mounted) return;
+      setState(() => isConnected = connected);
+
+      if (!connected) {
+        //  Connection dropped — stop everything cleanly
+        _stopIdleTimer();
+
+        // If a test was running, pause it so it can resume after reconnect
+        if (_testRunning && !_testPaused) {
+          _testPaused = true;
+          setState(() => _currentPhase = "idle");
         }
+
+        if (kDebugMode) print("UI: Connection lost — status updated to Disconnected");
+      } else {
+        //  Reconnected — restart idle timer and resume state
+        _startIdleTimer();
+        if (kDebugMode) print("UI: Reconnected — status updated to Connected");
       }
     };
 
@@ -136,7 +143,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     };
   }
 
-  // ✅ NEW: Setup flutter_foreground_task
+  //  NEW: Setup flutter_foreground_task
   void _initForegroundTask() {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
@@ -153,13 +160,13 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       foregroundTaskOptions: ForegroundTaskOptions(
         eventAction: ForegroundTaskEventAction.repeat(5000), // heartbeat every 5s
         autoRunOnBoot: false,
-        allowWakeLock: true, // ✅ Prevents CPU from sleeping — critical for BLE
+        allowWakeLock: true, //  Prevents CPU from sleeping — critical for BLE
         allowWifiLock: false,
       ),
     );
   }
 
-  // ✅ NEW: Start the foreground task (shows persistent notification, keeps process alive)
+  //  NEW: Start the foreground task (shows persistent notification, keeps process alive)
   Future<void> _startForegroundTask() async {
     if (await FlutterForegroundTask.isRunningService) return;
 
@@ -171,7 +178,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     );
   }
 
-  // ✅ NEW: Stop the foreground task when disconnected
+  //  NEW: Stop the foreground task when disconnected
   Future<void> _stopForegroundTask() async {
     await FlutterForegroundTask.stopService();
   }
@@ -186,7 +193,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  // ✅ NEW: Handle app going to background / coming to foreground
+  //  NEW: Handle app going to background / coming to foreground
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
@@ -272,7 +279,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
     final start = DateTime.now();
     DateTime lastKeepAlive = DateTime.fromMillisecondsSinceEpoch(0);
-    const mandatoryMoveMs = 6000; // Motor runs AT LEAST 6 seconds no matter what
+    const mandatoryMoveMs = 8000; // Motor runs AT LEAST 8 seconds no matter what
 
 
     while (_testRunning && !_testPaused) {
@@ -483,10 +490,10 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     if (isConnected) {
       await ble.disconnect();
       _stopIdleTimer();
-      // ✅ Stop foreground task when user disconnects
+      //  Stop foreground task when user disconnects
       await _stopForegroundTask();
     } else {
-      // ✅ Start foreground task BEFORE connecting — keeps process alive
+      //  Start foreground task BEFORE connecting — keeps process alive
       await _startForegroundTask();
       await ble.scanAndConnect();
     }
@@ -779,11 +786,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                                     fontWeight: FontWeight.bold,
                                     color: Colors.grey)),
                             const SizedBox(height: 5),
-                            GestureDetector(
-                              onTapDown: (_) =>
+                            Listener(
+                              onPointerDown: (_) =>
                                   _startContinuousCommand(Commands.up),
-                              onTapUp: (_) => _stopContinuousCommand(),
-                              onTapCancel: _stopContinuousCommand,
+                              onPointerUp: (_) => _stopContinuousCommand(),
+                              onPointerCancel: (_) => _stopContinuousCommand(),
                               child: Container(
                                 alignment: Alignment.center,
                                 padding:
@@ -813,11 +820,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                               ),
                             ),
                             const SizedBox(height: 10),
-                            GestureDetector(
-                              onTapDown: (_) =>
+                            Listener(
+                              onPointerDown: (_) =>
                                   _startContinuousCommand(Commands.down),
-                              onTapUp: (_) => _stopContinuousCommand(),
-                              onTapCancel: _stopContinuousCommand,
+                              onPointerUp: (_) => _stopContinuousCommand(),
+                              onPointerCancel: (_) => _stopContinuousCommand(),
                               child: Container(
                                 alignment: Alignment.center,
                                 padding:
