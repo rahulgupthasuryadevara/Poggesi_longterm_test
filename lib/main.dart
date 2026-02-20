@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'bluetooth_helper.dart';
 import 'command_helper.dart';
+import 'logs_page.dart';
 
 //  NEW: Top-level callback for flutter_foreground_task
 // This runs in a separate isolate — keep it lightweight
@@ -75,6 +76,10 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   // Result
   int cyclesCompleted = 0;
 
+  List<Map<String, dynamic>> currentLogs = [];
+  int latest30020 = 0;
+  Timer? _upPhaseTimer;
+
   // Keep-alive timer
   Timer? _idleTimer;
 
@@ -82,10 +87,6 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   int _currentCycleIndex = 0;
   String _currentPhase = "idle";
   double _phaseElapsedMs = 0;
-
-  // Logs (optional)
-  List<Map<String, dynamic>> currentLogs = [];
-  int latest11011 = 0;
 
   // Safety timeout per direction
   final int _maxMoveMs = 60000;
@@ -138,6 +139,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
           moveProgress = val;
           _lastMoveProgressUpdate = DateTime.now();
           if (mounted) setState(() {});
+        }
+      }else if (msg.startsWith("#R30020=")) {
+        final val1 = int.tryParse(msg.split("=").last);
+        if (val1 != null) {
+          latest30020 = val1;
         }
       }
     };
@@ -251,6 +257,15 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     return null;
   }
 
+  Future<void> _read30020() async {
+    if (!isConnected) return;
+    await ble.sendCommand("#GR=30020\n");
+    await Future.delayed(const Duration(milliseconds: 200));
+    // latest30020 will be set in onDataReceived
+  }
+
+
+
   // ---------------------------------------------------------------------------
   // UI inputs
   // ---------------------------------------------------------------------------
@@ -279,7 +294,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
     final start = DateTime.now();
     DateTime lastKeepAlive = DateTime.fromMillisecondsSinceEpoch(0);
-    const mandatoryMoveMs = 8000; // Motor runs AT LEAST 8 seconds no matter what
+    const mandatoryMoveMs = 25000; // Motor runs AT LEAST 25 seconds no matter what
 
 
     while (_testRunning && !_testPaused) {
@@ -382,8 +397,32 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       }
 
       if (_currentPhase == "up") {
+        // Cancel any previous timer just in case
+        _upPhaseTimer?.cancel();
+
+        // Start 7s delayed read
+        _upPhaseTimer = Timer(const Duration(seconds: 7), () async {
+          if (_testRunning &&
+              !_testPaused &&
+              _currentPhase == "up") {
+            await _read30020();
+
+            currentLogs.add({
+              "cycle": _currentCycleIndex + 1,
+              "value1": latest30020,
+            });
+
+            setState(() {});
+          }
+        });
+
         await _moveUntilControllerStops(goingUp: true);
-        if (!_testRunning || _testPaused) break;
+
+        if (!_testRunning || (_testPaused && _currentPhase == "up")) {
+          _upPhaseTimer?.cancel();
+          break;
+        }
+
         _currentPhase = "waitUp";
         _phaseElapsedMs = 0;
         setState(() {});
@@ -583,6 +622,13 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                     leading: const Icon(Icons.list, color: Colors.black54),
                     title: const Text('Logs',
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
+                    onTap: (){
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (context) => LogsPage(logs: currentLogs),
+                        ),
+                      );
+                    },
                   ),
                 ],
               ),
