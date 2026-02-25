@@ -5,6 +5,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'bluetooth_helper.dart';
 import 'command_helper.dart';
 import 'logs_page.dart';
+import 'logs_acc.dart';
 
 //  NEW: Top-level callback for flutter_foreground_task
 // This runs in a separate isolate — keep it lightweight
@@ -77,7 +78,9 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   int cyclesCompleted = 0;
 
   List<Map<String, dynamic>> currentLogs = [];
+  List<Map<String, dynamic>> currentLogs2 = [];
   int latest30020 = 0;
+  int latest20010 = 0;
   Timer? _upPhaseTimer;
 
   // Keep-alive timer
@@ -144,6 +147,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
         final val1 = int.tryParse(msg.split("=").last);
         if (val1 != null) {
           latest30020 = val1;
+        }
+      }else if (msg.startsWith("#R20010=")){
+        final val2 = int.tryParse(msg.split("=").last);
+        if (val2 != null) {
+          latest20010 = val2;
         }
       }
     };
@@ -261,6 +269,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     if (!isConnected) return;
     await ble.sendCommand("#GR=30020\n");
     await Future.delayed(const Duration(milliseconds: 200));
+    await ble.sendCommand("#GR=20010\n");
     // latest30020 will be set in onDataReceived
   }
 
@@ -378,6 +387,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     } else {
       _setValues();
       currentLogs.clear();
+      currentLogs2.clear();
 
       cyclesCompleted = 0;
       _currentCycleIndex = 0;
@@ -410,6 +420,10 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
             currentLogs.add({
               "cycle": _currentCycleIndex + 1,
               "value1": latest30020,
+            });
+            currentLogs2.add({
+              "cycle": _currentCycleIndex + 1,
+              "value2": latest20010,
             });
 
             setState(() {});
@@ -613,14 +627,21 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                     title: Text('Logout',
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
                   ),
-                  const ListTile(
-                    leading: Icon(Icons.info_outline, color: Colors.black54),
-                    title: Text('About',
+                  ListTile(
+                    leading: const Icon(Icons.info_outline, color: Colors.black54),
+                    title: const Text('Logs_acc',
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
+                    onTap: (){
+                      Navigator.of(context).push(
+                         MaterialPageRoute(
+                          builder: (context) => Logs2Page(logs: currentLogs2),
+                        ),
+                      );
+                    },
                   ),
                   ListTile(
                     leading: const Icon(Icons.list, color: Colors.black54),
-                    title: const Text('Logs',
+                    title: const Text('Logs_bottom',
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
                     onTap: (){
                       Navigator.of(context).push(

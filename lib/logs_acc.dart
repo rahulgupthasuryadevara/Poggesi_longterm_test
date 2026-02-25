@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
 import 'main.dart';
 
-class LogsPage extends StatelessWidget {
+class Logs2Page extends StatelessWidget {
   final List<Map<String, dynamic>> logs;
 
-  const LogsPage({super.key, required this.logs});
+  const Logs2Page({super.key, required this.logs});
 
   @override
   Widget build(BuildContext context) {
@@ -25,7 +25,7 @@ class LogsPage extends StatelessWidget {
         itemBuilder: (context, index) {
           final item = logs[index];
           final cycle = item['cycle'];
-          final value1 = item['value1'];
+          final value2 = item['value2'];
 
           return Card(
             margin:
@@ -40,7 +40,7 @@ class LogsPage extends StatelessWidget {
                 ),
               ),
               subtitle: Text(
-                "Bottom threshold Value: $value1",
+                "Acceleartion time: $value2",
                 style: const TextStyle(fontSize: 16),
               ),
             ),
