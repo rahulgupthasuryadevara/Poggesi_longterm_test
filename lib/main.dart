@@ -6,6 +6,8 @@ import 'bluetooth_helper.dart';
 import 'command_helper.dart';
 import 'logs_page.dart';
 import 'logs_acc.dart';
+import 'logs_top.dart';
+import 'logs_speed.dart';
 
 //  NEW: Top-level callback for flutter_foreground_task
 // This runs in a separate isolate — keep it lightweight
@@ -79,8 +81,14 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
   List<Map<String, dynamic>> currentLogs = [];
   List<Map<String, dynamic>> currentLogs2 = [];
+  List<Map<String, dynamic>> currentLogs3 = [];
+  List<Map<String, dynamic>> currentLogs4 = [];
   int latest30020 = 0;
   int latest20010 = 0;
+  int latest30026=0;
+  int latest20009=0;
+
+  // Phase timer
   Timer? _upPhaseTimer;
 
   // Keep-alive timer
@@ -97,6 +105,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   // Poll rates
   final Duration _progressPollInterval = const Duration(milliseconds: 120);
   final Duration _keepAliveMoveInterval = const Duration(milliseconds: 700);
+
+
 
   // ---------------------------------------------------------------------------
   // Lifecycle
@@ -152,6 +162,16 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
         final val2 = int.tryParse(msg.split("=").last);
         if (val2 != null) {
           latest20010 = val2;
+        }
+      }else if (msg.startsWith("#R30026=")){
+        final val3 = int.tryParse(msg.split("=").last);
+        if (val3 != null) {
+          latest30026 = val3;
+        }
+      }else if (msg.startsWith("#R20009=")){
+        final val3 = int.tryParse(msg.split("=").last);
+        if (val3 != null) {
+          latest20009 = val3;
         }
       }
     };
@@ -267,9 +287,13 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
   Future<void> _read30020() async {
     if (!isConnected) return;
-    await ble.sendCommand("#GR=30020\n");
+    await ble.sendCommand("#GR=30020\n");//bottom limit
     await Future.delayed(const Duration(milliseconds: 200));
-    await ble.sendCommand("#GR=20010\n");
+    await ble.sendCommand("#GR=20010\n");//acceleartion
+    await Future.delayed(const Duration(milliseconds: 200));
+    await ble.sendCommand("#GR=30026\n");//top limit
+    await Future.delayed(const Duration(milliseconds: 200));
+    await ble.sendCommand("#GR=20009\n");//speed
     // latest30020 will be set in onDataReceived
   }
 
@@ -303,7 +327,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
     final start = DateTime.now();
     DateTime lastKeepAlive = DateTime.fromMillisecondsSinceEpoch(0);
-    const mandatoryMoveMs = 25000; // Motor runs AT LEAST 25 seconds no matter what
+    const mandatoryMoveMs = 30000; // Motor runs AT LEAST 25 seconds no matter what
 
 
     while (_testRunning && !_testPaused) {
@@ -388,6 +412,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       _setValues();
       currentLogs.clear();
       currentLogs2.clear();
+      currentLogs3.clear();
+      currentLogs4.clear();
 
       cyclesCompleted = 0;
       _currentCycleIndex = 0;
@@ -424,6 +450,13 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
             currentLogs2.add({
               "cycle": _currentCycleIndex + 1,
               "value2": latest20010,
+            });
+            currentLogs3.add({
+              "cycle": _currentCycleIndex + 1,
+              "value3": latest30026,});
+            currentLogs4.add({
+              "cycle": _currentCycleIndex + 1,
+              "value4": latest20009,
             });
 
             setState(() {});
@@ -617,19 +650,34 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                     title: Text('Language',
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
                   ),
-                  const ListTile(
+                  ListTile(
                     leading: Icon(Icons.dark_mode, color: Colors.black54),
-                    title: Text('Dark mode',
+                    title: Text('Logs_speed',
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
+                    onTap: (){
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (context) => Logs4Page(logs: currentLogs4),
+                        ),
+                      );
+                    },
+
                   ),
-                  const ListTile(
+                  ListTile(
                     leading: Icon(Icons.logout, color: Colors.black54),
-                    title: Text('Logout',
+                    title: Text('Logs_Top',
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
+                    onTap: (){
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (context) => Logs3Page(logs: currentLogs3),
+                        ),
+                      );
+                    },
                   ),
                   ListTile(
                     leading: const Icon(Icons.info_outline, color: Colors.black54),
-                    title: const Text('Logs_acc',
+                    title: const Text('Logs_acceleration',
                         style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
                     onTap: (){
                       Navigator.of(context).push(
