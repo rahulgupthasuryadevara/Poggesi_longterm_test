@@ -15,19 +15,19 @@ class BluetoothHelper {
 
   Timer? _keepAliveTimer;
 
-  //  NEW: Connection state subscription — monitors drops and triggers reconnect
+  // Connection state subscription — monitors drops and triggers reconnect
   StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
 
-  //  NEW: Flag to prevent multiple simultaneous reconnect attempts
+  // Flag to prevent multiple simultaneous reconnect attempts
   bool _isReconnecting = false;
 
-  //  NEW: Flag to know if user intentionally disconnected (don't auto-reconnect)
+  // Flag to know if user intentionally disconnected (don't auto-reconnect)
   bool _userDisconnected = false;
 
   // Callback for incoming messages (used by main.dart)
   void Function(String msg)? onDataReceived;
 
-  //  NEW: Callback so main.dart knows when connection drops/restores
+  // Callback so main.dart knows when connection drops/restores
   void Function(bool connected)? onConnectionStateChanged;
 
   Future<bool> get isActuallyConnected async {
@@ -35,6 +35,8 @@ class BluetoothHelper {
     final state = await device!.connectionState.first;
     return state == BluetoothConnectionState.connected;
   }
+
+  String get connectedDeviceName => device?.platformName ?? "Unknown Device";
 
   Queue<String> commandQueue = Queue<String>();
   bool isWriting = false;
@@ -67,7 +69,6 @@ class BluetoothHelper {
     _processQueue();
   }
 
-  //  FIXED: Keep-alive timer now enabled (was commented out before)
   void _startKeepAliveTimer() {
     _keepAliveTimer?.cancel();
     _keepAliveTimer = Timer.periodic(const Duration(seconds: 4), (timer) async {
@@ -115,7 +116,6 @@ class BluetoothHelper {
   }
 
   Future<void> disconnect() async {
-    //  Mark as intentional disconnect — prevents auto-reconnect
     _userDisconnected = true;
     _stopKeepAliveTimer();
     _connectionStateSubscription?.cancel();
@@ -135,7 +135,6 @@ class BluetoothHelper {
     }
   }
 
-  //  NEW: Monitor connection state and auto-reconnect when dropped
   void _listenToConnectionState() {
     _connectionStateSubscription?.cancel();
     _connectionStateSubscription = device!.connectionState.listen((state) async {
@@ -146,7 +145,6 @@ class BluetoothHelper {
         notifyChar = null;
         onConnectionStateChanged?.call(false);
 
-        // Don't reconnect if user intentionally disconnected
         if (_userDisconnected || _isReconnecting) return;
 
         if (kDebugMode) print("Connection dropped! Attempting auto-reconnect...");
@@ -157,7 +155,6 @@ class BluetoothHelper {
     });
   }
 
-  //  NEW: Auto-reconnect with retry logic
   Future<void> _autoReconnect() async {
     if (_isReconnecting || device == null) return;
     _isReconnecting = true;
@@ -170,14 +167,9 @@ class BluetoothHelper {
       if (kDebugMode) print("Reconnect attempt $attempts/$maxAttempts...");
 
       try {
-        // Wait a bit before retrying
         await Future.delayed(Duration(seconds: attempts * 2));
-
         await device!.connect(autoConnect: false, mtu: 23);
-
-        // Re-discover services after reconnect
         await _discoverAndSubscribe();
-
         if (kDebugMode) print("Reconnected successfully!");
         _isReconnecting = false;
         return;
@@ -191,7 +183,6 @@ class BluetoothHelper {
     device = null;
   }
 
-  //  NEW: Extracted service discovery into its own method (used by both connect and reconnect)
   Future<void> _discoverAndSubscribe() async {
     final services = await device!.discoverServices();
     for (final s in services) {
@@ -216,17 +207,43 @@ class BluetoothHelper {
     }
   }
 
-  Future<void> scanAndConnect() async {
+  Future<void> startScan() async {
     final Map<Permission, PermissionStatus> statuses =
-    await [Permission.bluetoothScan, Permission.bluetoothConnect].request();
+    await [Permission.bluetoothScan, Permission.bluetoothConnect, Permission.location].request();
 
     if (statuses.values.any((s) => !s.isGranted)) {
-      if (kDebugMode) print("Missing Bluetooth permissions");
+      if (kDebugMode) print("Missing Bluetooth/Location permissions");
       await openAppSettings();
       return;
     }
 
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 3));
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+  }
+
+  Future<bool> connectToDevice(BluetoothDevice targetDevice) async {
+    device = targetDevice;
+    _userDisconnected = false;
+    _isReconnecting = false;
+
+    if (kDebugMode) print("Connecting to ${device!.platformName}...");
+
+    try {
+      await device!.connect(autoConnect: false, mtu: 23);
+    } catch (e) {
+      if (kDebugMode) print("Connection failed: $e");
+      return false;
+    }
+
+    if (kDebugMode) print("Connected to ${device!.platformName}");
+    _listenToConnectionState();
+    await _discoverAndSubscribe();
+    _startKeepAliveTimer();
+    return true;
+  }
+
+  // Backward compatibility or quick search if needed
+  Future<void> scanAndConnect() async {
+    await startScan();
     await FlutterBluePlus.isScanning.where((val) => val == false).first;
 
     ScanResult? target;
@@ -238,36 +255,8 @@ class BluetoothHelper {
       target = null;
     }
 
-    if (target == null) {
-      if (kDebugMode) print("Device not found nearby.");
-      return;
+    if (target != null) {
+      await connectToDevice(target.device);
     }
-
-    device = target.device;
-    //  Reset the intentional disconnect flag
-    _userDisconnected = false;
-    _isReconnecting = false;
-
-    if (kDebugMode) print("Connecting to ${device!.platformName}...");
-
-    try {
-      //  CHANGED: autoConnect: false for initial connect (faster),
-      // auto-reconnect is handled by our own _autoReconnect() logic
-      await device!.connect(autoConnect: false, mtu: 23);
-    } catch (e) {
-      if (kDebugMode) print("Connection failed: $e");
-      return;
-    }
-
-    if (kDebugMode) print("Connected to ${device!.platformName}");
-
-    //  Start monitoring connection state BEFORE anything else
-    _listenToConnectionState();
-
-    // Discover services and subscribe to notifications
-    await _discoverAndSubscribe();
-
-    //  Start keep-alive timer (was commented out before — this is critical!)
-    _startKeepAliveTimer();
   }
 }
