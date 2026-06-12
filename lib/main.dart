@@ -289,7 +289,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   }
 
   Future<void> _startContinuousCommand(String cmd) async {
-    if (!isConnected) return;
+    if (!isConnected || (_testRunning && !_testPaused)) return;
     _isPressed = true;
     _stopIdleTimer();
     while (_isPressed) {
@@ -297,7 +297,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       await Future.delayed(const Duration(milliseconds: 700));
     }
     await ble.sendCommand(Commands.idle);
-    if (!_testRunning) _startIdleTimer();
+    if (!_testRunning || _testPaused) _startIdleTimer();
   }
 
   void _stopContinuousCommand() {
@@ -305,7 +305,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     ble.emergencyStop(Commands.idle);
     Future.delayed(const Duration(milliseconds: 50), () {
       ble.sendCommand(Commands.idle);
-      if (!_testRunning) _startIdleTimer();
+      if (!_testRunning || _testPaused) _startIdleTimer();
     });
   }
 
@@ -330,6 +330,13 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    // Controls should be enabled if we are not running a test OR if the test is paused.
+    bool controlsEnabled = !_testRunning || _testPaused;
+    // Start/Resume button is only disabled when the test is running AND not paused.
+    bool startEnabled = !_testRunning || _testPaused;
+    // Disconnect button is enabled if test is not running OR if it's paused.
+    bool disconnectEnabled = !_testRunning || _testPaused;
+
     return Scaffold(
       backgroundColor: Colors.grey[300],
       appBar: AppBar(
@@ -420,35 +427,58 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             const SizedBox(height: 5),
             Row(
               children: [
-                Container(
-                  height: 170,
-                  width: 150,
-                  decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))]),
-                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 3),
-                  child: Column(
-                    children: [
-                      const Text('CONTROLS', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.grey)),
-                      const SizedBox(height: 5),
-                      Listener(onPointerDown: (_) => _startContinuousCommand(Commands.up), onPointerUp: (_) => _stopContinuousCommand(), onPointerCancel: (_) => _stopContinuousCommand(), child: _controlButton('UP', Icons.arrow_upward)),
-                      const SizedBox(height: 10),
-                      Listener(onPointerDown: (_) => _startContinuousCommand(Commands.down), onPointerUp: (_) => _stopContinuousCommand(), onPointerCancel: (_) => _stopContinuousCommand(), child: _controlButton('DOWN', Icons.arrow_downward)),
-                    ],
+                AbsorbPointer(
+                  absorbing: !controlsEnabled,
+                  child: Container(
+                    height: 170,
+                    width: 150,
+                    decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))]),
+                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 3),
+                    child: Column(
+                      children: [
+                        const Text('CONTROLS', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.grey)),
+                        const SizedBox(height: 5),
+                        Listener(onPointerDown: (_) => _startContinuousCommand(Commands.up), onPointerUp: (_) => _stopContinuousCommand(), onPointerCancel: (_) => _stopContinuousCommand(), child: _controlButton('UP', Icons.arrow_upward, isEnabled: controlsEnabled)),
+                        const SizedBox(height: 10),
+                        Listener(onPointerDown: (_) => _startContinuousCommand(Commands.down), onPointerUp: (_) => _stopContinuousCommand(), onPointerCancel: (_) => _stopContinuousCommand(), child: _controlButton('DOWN', Icons.arrow_downward, isEnabled: controlsEnabled)),
+                      ],
+                    ),
                   ),
                 ),
                 const SizedBox(width: 15),
                 Column(
                   children: [
-                    ElevatedButton.icon(onPressed: _startTest, icon: Icon(_testPaused ? Icons.play_arrow : Icons.play_circle_fill), label: Text(_testPaused ? 'Resume Test' : 'Start Test', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE96A1E), foregroundColor: Colors.white, minimumSize: const Size(10, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
+                    ElevatedButton.icon(
+                      onPressed: startEnabled ? _startTest : null, 
+                      icon: Icon(_testPaused ? Icons.play_arrow : Icons.play_circle_fill), 
+                      label: Text(_testPaused ? 'Resume Test' : 'Start Test', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), 
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: startEnabled ? const Color(0xFFE96A1E) : Colors.grey, 
+                        foregroundColor: Colors.white, 
+                        minimumSize: const Size(10, 40), 
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))
+                      )
+                    ),
                     const SizedBox(height: 10),
-                    ElevatedButton.icon(onPressed: _pauseTest, icon: const Icon(Icons.pause), label: const Text('Pause Test', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: Colors.amber, foregroundColor: Colors.white, minimumSize: const Size(10, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
+                    ElevatedButton.icon(onPressed: (_testRunning && !_testPaused) ? _pauseTest : null, icon: const Icon(Icons.pause), label: const Text('Pause Test', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: (_testRunning && !_testPaused) ? Colors.amber : Colors.grey, foregroundColor: Colors.white, minimumSize: const Size(10, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
                     const SizedBox(height: 10),
-                    ElevatedButton.icon(onPressed: _stopTest, icon: const Icon(Icons.stop), label: const Text('Stop Test', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE96A1E), foregroundColor: Colors.white, minimumSize: const Size(10, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
+                    ElevatedButton.icon(onPressed: _testRunning ? _stopTest : null, icon: const Icon(Icons.stop), label: const Text('Stop Test', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: _testRunning ? const Color(0xFFE96A1E) : Colors.grey, foregroundColor: Colors.white, minimumSize: const Size(10, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
                   ],
                 ),
               ],
             ),
             const SizedBox(height: 20),
-            ElevatedButton.icon(onPressed: scanAndConnect, icon: Icon(isConnected ? Icons.bluetooth_disabled : Icons.bluetooth), label: Text(isConnected ? 'Disconnect' : 'Connect', style: const TextStyle(fontSize: 20)), style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE96A1E), foregroundColor: Colors.white, minimumSize: const Size(double.infinity, 55), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
+            ElevatedButton.icon(
+              onPressed: disconnectEnabled ? scanAndConnect : null, 
+              icon: Icon(isConnected ? Icons.bluetooth_disabled : Icons.bluetooth), 
+              label: Text(isConnected ? 'Disconnect' : 'Connect', style: const TextStyle(fontSize: 20)), 
+              style: ElevatedButton.styleFrom(
+                backgroundColor: disconnectEnabled ? const Color(0xFFE96A1E) : Colors.grey, 
+                foregroundColor: Colors.white, 
+                minimumSize: const Size(double.infinity, 55), 
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))
+              )
+            ),
           ],
         ),
       ),
@@ -464,11 +494,15 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _controlButton(String label, IconData icon) {
+  Widget _controlButton(String label, IconData icon, {bool isEnabled = true}) {
     return Container(
       alignment: Alignment.center,
       padding: const EdgeInsets.symmetric(vertical: 14),
-      decoration: BoxDecoration(color: const Color(0xFFE96A1E), borderRadius: BorderRadius.circular(6), boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))]),
+      decoration: BoxDecoration(
+        color: isEnabled ? const Color(0xFFE96A1E) : Colors.grey, 
+        borderRadius: BorderRadius.circular(6), 
+        boxShadow: isEnabled ? const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))] : null
+      ),
       child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [Icon(icon, color: Colors.white), const SizedBox(width: 8), Text(label, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold))]),
     );
   }
