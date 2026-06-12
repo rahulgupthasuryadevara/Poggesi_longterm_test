@@ -72,6 +72,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Timer? _idleTimer;
   int _currentCycleIndex = 0;
   String _currentPhase = 'idle';
+  int _timeLeftSeconds = 0;
 
   @override
   void initState() {
@@ -185,8 +186,15 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     DateTime lastSent = DateTime.fromMillisecondsSinceEpoch(0);
     const sendInterval = Duration(milliseconds: 700);
     while (_testRunning && !_testPaused) {
-      final elapsed = DateTime.now().difference(start).inMilliseconds;
-      if (elapsed >= totalMs) break;
+      final elapsedMs = DateTime.now().difference(start).inMilliseconds;
+      if (elapsedMs >= totalMs) break;
+
+      // Update countdown
+      final remaining = ((totalMs - elapsedMs) / 1000).ceil();
+      if (remaining != _timeLeftSeconds) {
+        setState(() => _timeLeftSeconds = remaining);
+      }
+
       if (DateTime.now().difference(lastSent) >= sendInterval) {
         await ble.sendCommand(goingUp ? Commands.up : Commands.down);
         lastSent = DateTime.now();
@@ -204,8 +212,15 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     final start = DateTime.now();
     DateTime lastPing = DateTime.now().subtract(const Duration(seconds: 2));
     while (_testRunning && !_testPaused) {
-      final elapsed = DateTime.now().difference(start).inMilliseconds;
-      if (elapsed >= totalMs) break;
+      final elapsedMs = DateTime.now().difference(start).inMilliseconds;
+      if (elapsedMs >= totalMs) break;
+
+      // Update countdown
+      final remaining = ((totalMs - elapsedMs) / 1000).ceil();
+      if (remaining != _timeLeftSeconds) {
+        setState(() => _timeLeftSeconds = remaining);
+      }
+
       if (DateTime.now().difference(lastPing) >= const Duration(seconds: 2)) {
         await ble.sendCommand(Commands.idle);
         lastPing = DateTime.now();
@@ -227,6 +242,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       cyclesCompleted = 0;
       _currentCycleIndex = 0;
       _currentPhase = 'up';
+      _timeLeftSeconds = _moveUpSeconds;
       _testRunning = true;
       _testPaused = false;
       _stopIdleTimer();
@@ -256,6 +272,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _currentCycleIndex++;
         cyclesCompleted = _currentCycleIndex;
         _currentPhase = (_currentCycleIndex < _cycles) ? 'up' : 'idle';
+        if (_currentPhase == 'idle') _timeLeftSeconds = 0;
         setState(() {});
       }
     }
@@ -265,6 +282,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     _testPaused = false;
     _currentPhase = 'idle';
     _currentCycleIndex = 0;
+    _timeLeftSeconds = 0;
     await ble.sendCommand(Commands.idle);
     _startIdleTimer();
     setState(() {});
@@ -283,6 +301,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     _testPaused = false;
     _currentPhase = 'idle';
     _currentCycleIndex = 0;
+    _timeLeftSeconds = 0;
     await ble.sendCommand(Commands.idle);
     _startIdleTimer();
     setState(() {});
@@ -418,6 +437,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                         Text(cyclesCompleted.toString(), style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold, color: Colors.green)),
                         const SizedBox(height: 6),
                         Text('Phase: $_currentPhase', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 2),
+                        Text('Time left: ${_timeLeftSeconds}s', style: const TextStyle(fontSize: 12, color: Colors.blueGrey, fontWeight: FontWeight.bold)),
                       ],
                     ),
                   ),
