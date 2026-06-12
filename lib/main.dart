@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'bluetooth_helper.dart';
@@ -63,16 +62,17 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   int _moveDownSeconds = 40;
   int _waitUpSeconds = 5;
   int _waitDownSeconds = 5;
+  int _waitEvery = 1; // Perform bottom wait every X cycles
 
   final TextEditingController _cyclesController = TextEditingController(text: '3');
   final TextEditingController _moveUpController = TextEditingController(text: '40');
   final TextEditingController _moveDownController = TextEditingController(text: '40');
   final TextEditingController _waitUpController = TextEditingController(text: '5');
   final TextEditingController _waitDownController = TextEditingController(text: '5');
+  final TextEditingController _waitEveryController = TextEditingController(text: '1');
 
-  int cyclesCompleted = 0;
+  double cyclesCompleted = 0.0;
   Timer? _idleTimer;
-  int _currentCycleIndex = 0;
   String _currentPhase = 'idle';
   int _timeLeftSeconds = 0;
 
@@ -91,7 +91,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _stopIdleTimer();
         if (_testRunning && !_testPaused) {
           _testPaused = true;
-          // Save progress when auto-paused by disconnection
           _saveSession();
           setState(() {});
         }
@@ -141,6 +140,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     _moveDownController.dispose();
     _waitUpController.dispose();
     _waitDownController.dispose();
+    _waitEveryController.dispose();
     _idleTimer?.cancel();
     super.dispose();
   }
@@ -176,17 +176,20 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     final mDown = int.tryParse(_moveDownController.text);
     final wUp = int.tryParse(_waitUpController.text);
     final wDown = int.tryParse(_waitDownController.text);
+    final every = int.tryParse(_waitEveryController.text);
+
     if (cycles != null && cycles > 0) _cycles = cycles;
     if (mUp != null && mUp > 0) _moveUpSeconds = mUp;
     if (mDown != null && mDown > 0) _moveDownSeconds = mDown;
     if (wUp != null && wUp >= 0) _waitUpSeconds = wUp;
     if (wDown != null && wDown >= 0) _waitDownSeconds = wDown;
+    if (every != null && every > 0) _waitEvery = every;
     setState(() {});
   }
 
   Future<void> _runMove({required bool goingUp}) async {
     final totalMs = (goingUp ? _moveUpSeconds : _moveDownSeconds) * 1000;
-    _currentPhase = goingUp ? 'up' : 'down';
+    _currentPhase = goingUp ? 'Opening' : 'Closing';
     setState(() {});
     final start = DateTime.now();
     DateTime lastSent = DateTime.fromMillisecondsSinceEpoch(0);
@@ -195,11 +198,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       final elapsedMs = DateTime.now().difference(start).inMilliseconds;
       if (elapsedMs >= totalMs) break;
 
-      // Update countdown
       final remaining = ((totalMs - elapsedMs) / 1000).ceil();
-      if (remaining != _timeLeftSeconds) {
-        setState(() => _timeLeftSeconds = remaining);
-      }
+      if (remaining != _timeLeftSeconds) setState(() => _timeLeftSeconds = remaining);
 
       if (DateTime.now().difference(lastSent) >= sendInterval) {
         await ble.sendCommand(goingUp ? Commands.up : Commands.down);
@@ -212,7 +212,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   Future<void> _runWait({required bool atTop}) async {
     final totalMs = (atTop ? _waitUpSeconds : _waitDownSeconds) * 1000;
-    _currentPhase = atTop ? 'waitUp' : 'waitDown';
+    _currentPhase = atTop ? 'Waiting Top' : 'Waiting Bottom';
     setState(() {});
     await ble.sendCommand(Commands.idle);
     final start = DateTime.now();
@@ -221,11 +221,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       final elapsedMs = DateTime.now().difference(start).inMilliseconds;
       if (elapsedMs >= totalMs) break;
 
-      // Update countdown
       final remaining = ((totalMs - elapsedMs) / 1000).ceil();
-      if (remaining != _timeLeftSeconds) {
-        setState(() => _timeLeftSeconds = remaining);
-      }
+      if (remaining != _timeLeftSeconds) setState(() => _timeLeftSeconds = remaining);
 
       if (DateTime.now().difference(lastPing) >= const Duration(seconds: 2)) {
         await ble.sendCommand(Commands.idle);
@@ -239,9 +236,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     if (_testStartTime == null) return;
     
     final session = TestSession(
-      umbrellaName: ble.connectedDeviceName ?? "Unknown Umbrella",
+      umbrellaName: ble.connectedDeviceName,
       totalCycles: _cycles,
-      completedCycles: cyclesCompleted,
+      completedCycles: cyclesCompleted.toInt(),
       startTime: _testStartTime!,
       endTime: DateTime.now(),
     );
@@ -259,62 +256,65 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       return;
     } else {
       _setValues();
-      cyclesCompleted = 0;
-      _currentCycleIndex = 0;
-      _currentPhase = 'up';
-      _timeLeftSeconds = _moveUpSeconds;
+      cyclesCompleted = 0.0;
+      _currentPhase = 'Starting';
+      _timeLeftSeconds = 0;
       _testRunning = true;
       _testPaused = false;
       _testStartTime = DateTime.now();
       _stopIdleTimer();
-      // Initial save to mark start
       await _saveSession();
       setState(() {});
     }
 
-    while (_testRunning && _currentCycleIndex < _cycles) {
+    // Step-based logic for adaptable cycles (4 quarters per cycle)
+    int totalQuarters = (_cycles * 4).round();
+    int quartersDone = (cyclesCompleted * 4).round();
+
+    while (_testRunning && quartersDone < totalQuarters) {
       if (_testPaused) { _startIdleTimer(); return; }
-      if (_currentPhase == 'up') {
+      
+      int part = quartersDone % 4;
+      if (part == 0) {
         await _runMove(goingUp: true);
-        if (!_testRunning || _testPaused) break;
-        _currentPhase = 'waitUp';
-      }
-      if (_currentPhase == 'waitUp') {
+      } else if (part == 1) {
         await _runWait(atTop: true);
-        if (!_testRunning || _testPaused) break;
-        _currentPhase = 'down';
-      }
-      if (_currentPhase == 'down') {
+      } else if (part == 2) {
         await _runMove(goingUp: false);
-        if (!_testRunning || _testPaused) break;
-        _currentPhase = 'waitDown';
+      } else if (part == 3) {
+        // Only wait at bottom if we reached the grouping limit (e.g. wait every 2nd cycle)
+        int currentCycleNum = (quartersDone ~/ 4) + 1;
+        if (currentCycleNum % _waitEvery == 0) {
+          await _runWait(atTop: false);
+        } else {
+          // Mandatory 2s delay for controller stability if skipping full wait
+          _currentPhase = 'Settling';
+          await ble.sendCommand(Commands.idle);
+          for (int i = 2; i > 0; i--) {
+            if (!_testRunning || _testPaused) break;
+            setState(() => _timeLeftSeconds = i);
+            await Future.delayed(const Duration(seconds: 1));
+          }
+        }
       }
-      if (_currentPhase == 'waitDown') {
-        await _runWait(atTop: false);
-        if (!_testRunning || _testPaused) break;
-        _currentCycleIndex++;
-        cyclesCompleted = _currentCycleIndex;
-        
-        // Auto-save after every completed cycle
-        await _saveSession();
-        
-        _currentPhase = (_currentCycleIndex < _cycles) ? 'up' : 'idle';
-        if (_currentPhase == 'idle') _timeLeftSeconds = 0;
-        setState(() {});
-      }
+
+      if (!_testRunning || _testPaused) break;
+      
+      quartersDone++;
+      cyclesCompleted = quartersDone / 4.0;
+      
+      // Auto-save progress after every completed step
+      await _saveSession();
+      setState(() {});
     }
 
     if (_testPaused) { _startIdleTimer(); return; }
     
-    // Final update when test finishes naturally
-    if (_testRunning) {
-      await _saveSession();
-    }
+    if (_testRunning) await _saveSession();
 
     _testRunning = false;
     _testPaused = false;
     _currentPhase = 'idle';
-    _currentCycleIndex = 0;
     _timeLeftSeconds = 0;
     _testStartTime = null; 
     await ble.sendCommand(Commands.idle);
@@ -325,7 +325,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Future<void> _pauseTest() async {
     if (!_testRunning || _testPaused) return;
     _testPaused = true;
-    // Save progress immediately on pause
     await _saveSession();
     await ble.sendCommand(Commands.idle);
     _startIdleTimer();
@@ -333,13 +332,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   }
 
   Future<void> _stopTest() async {
-    if (_testRunning) {
-      await _saveSession();
-    }
+    if (_testRunning) await _saveSession();
     _testRunning = false;
     _testPaused = false;
     _currentPhase = 'idle';
-    _currentCycleIndex = 0;
+    cyclesCompleted = 0.0;
     _timeLeftSeconds = 0;
     _testStartTime = null;
     await ble.sendCommand(Commands.idle);
@@ -389,11 +386,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    // Controls should be enabled if we are not running a test OR if the test is paused.
     bool controlsEnabled = !_testRunning || _testPaused;
-    // Start/Resume button is only disabled when the test is running AND not paused.
     bool startEnabled = !_testRunning || _testPaused;
-    // Disconnect button is enabled if test is not running OR if it's paused.
     bool disconnectEnabled = !_testRunning || _testPaused;
 
     return Scaffold(
@@ -424,7 +418,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               leading: const Icon(Icons.history, color: Colors.black54),
               title: const Text('Test History', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
               onTap: () {
-                Navigator.pop(context); // Close drawer
+                Navigator.pop(context); 
                 Navigator.push(
                   context,
                   MaterialPageRoute(builder: (context) => const SessionsPage()),
@@ -471,6 +465,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                       _inputRow('Wait up:', _waitUpController, 's'),
                       const SizedBox(height: 6),
                       _inputRow('Wait down:', _waitDownController, 's'),
+                      const SizedBox(height: 6),
+                      _inputRow('Wait every:', _waitEveryController, 'cyc'),
                     ],
                   ),
                 ),
@@ -485,7 +481,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                         const SizedBox(height: 8),
                         const Text('CYCLES COMPLETED:', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFFE96A1E))),
                         const SizedBox(height: 4),
-                        Text(cyclesCompleted.toString(), style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold, color: Colors.green)),
+                        Text(cyclesCompleted.toInt().toString(), style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold, color: Colors.green)),
                         const SizedBox(height: 6),
                         Text('Phase: $_currentPhase', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
                         const SizedBox(height: 2),
@@ -523,18 +519,18 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                     ElevatedButton.icon(
                       onPressed: startEnabled ? _startTest : null, 
                       icon: Icon(_testPaused ? Icons.play_arrow : Icons.play_circle_fill), 
-                      label: Text(_testPaused ? 'Resume Test' : 'Start Test', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), 
+                      label: Text(_testPaused ? 'Resume' : 'Start', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), 
                       style: ElevatedButton.styleFrom(
                         backgroundColor: startEnabled ? const Color(0xFFE96A1E) : Colors.grey, 
                         foregroundColor: Colors.white, 
-                        minimumSize: const Size(10, 40), 
+                        minimumSize: const Size(110, 40), 
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))
                       )
                     ),
                     const SizedBox(height: 10),
-                    ElevatedButton.icon(onPressed: (_testRunning && !_testPaused) ? _pauseTest : null, icon: const Icon(Icons.pause), label: const Text('Pause Test', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: (_testRunning && !_testPaused) ? Colors.amber : Colors.grey, foregroundColor: Colors.white, minimumSize: const Size(10, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
+                    ElevatedButton.icon(onPressed: (_testRunning && !_testPaused) ? _pauseTest : null, icon: const Icon(Icons.pause), label: const Text('Pause', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: (_testRunning && !_testPaused) ? Colors.amber : Colors.grey, foregroundColor: Colors.white, minimumSize: const Size(110, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
                     const SizedBox(height: 10),
-                    ElevatedButton.icon(onPressed: _testRunning ? _stopTest : null, icon: const Icon(Icons.stop), label: const Text('Stop Test', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: _testRunning ? const Color(0xFFE96A1E) : Colors.grey, foregroundColor: Colors.white, minimumSize: const Size(10, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
+                    ElevatedButton.icon(onPressed: _testRunning ? _stopTest : null, icon: const Icon(Icons.stop), label: const Text('Stop', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: _testRunning ? const Color(0xFFE96A1E) : Colors.grey, foregroundColor: Colors.white, minimumSize: const Size(110, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
                   ],
                 ),
               ],
@@ -560,8 +556,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Widget _inputRow(String label, TextEditingController controller, String? suffix) {
     return Row(
       children: [
-        SizedBox(width: 85, child: Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
-        Expanded(child: SizedBox(height: 28, child: TextField(controller: controller, keyboardType: TextInputType.number, decoration: InputDecoration(suffixText: suffix, isDense: true, contentPadding: const EdgeInsets.symmetric(horizontal: 6), border: const OutlineInputBorder())))),
+        SizedBox(width: 85, child: Text(label, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
+        Expanded(child: SizedBox(height: 28, child: TextField(controller: controller, keyboardType: const TextInputType.numberWithOptions(decimal: false), decoration: InputDecoration(suffixText: suffix, isDense: true, contentPadding: const EdgeInsets.symmetric(horizontal: 6), border: const OutlineInputBorder())))),
       ],
     );
   }

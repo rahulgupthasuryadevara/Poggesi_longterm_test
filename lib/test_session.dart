@@ -26,8 +26,8 @@ class TestSession {
 
   factory TestSession.fromJson(Map<String, dynamic> json) => TestSession(
     umbrellaName: json['umbrellaName'],
-    totalCycles: json['totalCycles'],
-    completedCycles: json['completedCycles'],
+    totalCycles: (json['totalCycles'] as num).toInt(),
+    completedCycles: (json['completedCycles'] as num).toInt(),
     startTime: DateTime.parse(json['startTime']),
     endTime: DateTime.parse(json['endTime']),
   );
