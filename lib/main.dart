@@ -5,6 +5,8 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'bluetooth_helper.dart';
 import 'command_helper.dart';
 import 'device_selection_page.dart';
+import 'test_session.dart';
+import 'sessions_page.dart';
 
 @pragma('vm:entry-point')
 void startCallback() {
@@ -74,6 +76,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   String _currentPhase = 'idle';
   int _timeLeftSeconds = 0;
 
+  DateTime? _testStartTime;
+
   @override
   void initState() {
     super.initState();
@@ -87,6 +91,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         _stopIdleTimer();
         if (_testRunning && !_testPaused) {
           _testPaused = true;
+          // Save progress when auto-paused by disconnection
+          _saveSession();
           setState(() {});
         }
       } else {
@@ -229,6 +235,20 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _saveSession() async {
+    if (_testStartTime == null) return;
+    
+    final session = TestSession(
+      umbrellaName: ble.connectedDeviceName ?? "Unknown Umbrella",
+      totalCycles: _cycles,
+      completedCycles: cyclesCompleted,
+      startTime: _testStartTime!,
+      endTime: DateTime.now(),
+    );
+    
+    await TestSession.saveOrUpdateSession(session);
+  }
+
   Future<void> _startTest() async {
     if (!isConnected) return;
     if (_testRunning && _testPaused) {
@@ -245,7 +265,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       _timeLeftSeconds = _moveUpSeconds;
       _testRunning = true;
       _testPaused = false;
+      _testStartTime = DateTime.now();
       _stopIdleTimer();
+      // Initial save to mark start
+      await _saveSession();
       setState(() {});
     }
 
@@ -271,6 +294,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         if (!_testRunning || _testPaused) break;
         _currentCycleIndex++;
         cyclesCompleted = _currentCycleIndex;
+        
+        // Auto-save after every completed cycle
+        await _saveSession();
+        
         _currentPhase = (_currentCycleIndex < _cycles) ? 'up' : 'idle';
         if (_currentPhase == 'idle') _timeLeftSeconds = 0;
         setState(() {});
@@ -278,11 +305,18 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     }
 
     if (_testPaused) { _startIdleTimer(); return; }
+    
+    // Final update when test finishes naturally
+    if (_testRunning) {
+      await _saveSession();
+    }
+
     _testRunning = false;
     _testPaused = false;
     _currentPhase = 'idle';
     _currentCycleIndex = 0;
     _timeLeftSeconds = 0;
+    _testStartTime = null; 
     await ble.sendCommand(Commands.idle);
     _startIdleTimer();
     setState(() {});
@@ -291,17 +325,23 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Future<void> _pauseTest() async {
     if (!_testRunning || _testPaused) return;
     _testPaused = true;
+    // Save progress immediately on pause
+    await _saveSession();
     await ble.sendCommand(Commands.idle);
     _startIdleTimer();
     setState(() {});
   }
 
   Future<void> _stopTest() async {
+    if (_testRunning) {
+      await _saveSession();
+    }
     _testRunning = false;
     _testPaused = false;
     _currentPhase = 'idle';
     _currentCycleIndex = 0;
     _timeLeftSeconds = 0;
+    _testStartTime = null;
     await ble.sendCommand(Commands.idle);
     _startIdleTimer();
     setState(() {});
@@ -379,6 +419,17 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   Text('Settings', style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w500)),
                 ],
               ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.history, color: Colors.black54),
+              title: const Text('Test History', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
+              onTap: () {
+                Navigator.pop(context); // Close drawer
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const SessionsPage()),
+                );
+              },
             ),
             const ListTile(
               leading: Icon(Icons.language, color: Colors.black54),
