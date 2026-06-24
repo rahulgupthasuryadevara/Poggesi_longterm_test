@@ -1,5 +1,8 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:io';
+
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -207,13 +210,62 @@ class BluetoothHelper {
     }
   }
 
-  Future<void> startScan() async {
-    final Map<Permission, PermissionStatus> statuses =
-    await [Permission.bluetoothScan, Permission.bluetoothConnect, Permission.location].request();
+  Future<bool> _requestBlePermissions() async {
+    if (!Platform.isAndroid) return true;
 
-    if (statuses.values.any((s) => !s.isGranted)) {
-      if (kDebugMode) print("Missing Bluetooth/Location permissions");
+    final androidInfo = await DeviceInfoPlugin().androidInfo;
+    final sdkInt = androidInfo.version.sdkInt;
+
+    final permissions = <Permission>[];
+
+    if (sdkInt >= 31) {
+      // Android 12 and above
+      permissions.add(Permission.bluetoothScan);
+      permissions.add(Permission.bluetoothConnect);
+    } else {
+      // Android 11 and below
+      permissions.add(Permission.locationWhenInUse);
+    }
+
+    if (sdkInt >= 33) {
+      // Android 13 and above
+      permissions.add(Permission.notification);
+    }
+
+    final statuses = await permissions.request();
+
+    final missingRequiredPermission = statuses.entries.any((entry) {
+      // Notification permission should not block BLE scanning
+      if (entry.key == Permission.notification) {
+        return false;
+      }
+
+      return !entry.value.isGranted;
+    });
+
+    if (missingRequiredPermission) {
+      if (kDebugMode) {
+        print("Missing BLE permissions: $statuses");
+      }
       await openAppSettings();
+      return false;
+    }
+
+    return true;
+  }
+
+  Future<void> startScan() async {
+    final permissionOk = await _requestBlePermissions();
+
+    if (!permissionOk) {
+      if (kDebugMode) print("BLE permissions not granted");
+      return;
+    }
+
+    final adapterState = await FlutterBluePlus.adapterState.first;
+
+    if (adapterState != BluetoothAdapterState.on) {
+      if (kDebugMode) print("Bluetooth is not ON");
       return;
     }
 
