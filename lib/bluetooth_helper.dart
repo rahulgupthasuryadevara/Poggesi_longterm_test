@@ -86,6 +86,14 @@ class BluetoothHelper {
     _keepAliveTimer?.cancel();
   }
 
+  void pauseKeepAlive() {
+    _stopKeepAliveTimer();
+  }
+
+  void resumeKeepAlive() {
+    _startKeepAliveTimer();
+  }
+
   Future<void> sendCommand(String cmd) async {
     if (writeChar == null) return;
     try {

@@ -55,28 +55,45 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   bool _testRunning = false;
   bool _testPaused = false;
   bool _isPressed = false;
+  bool _readingInitialRegisters = false;
 
-  // Test configuration (defaults)
+  // Values read automatically from the controller.
+  int? minHeight; // #R20024=
+  int? maxHeight; // #R20025=
+  int? currentHeight; // live value from the expert-style current-height register
+
+  // User inputs. Height values are read automatically from the controller.
   int _cycles = 3;
-  int _moveUpSeconds = 40;
-  int _moveDownSeconds = 40;
   int _waitUpSeconds = 5;
   int _waitDownSeconds = 5;
-  int _waitEvery = 1; // Perform bottom wait every X cycles
+  int _waitEvery = 1; // Perform bottom pause every X cycles
 
   final TextEditingController _cyclesController = TextEditingController(text: '3');
-  final TextEditingController _moveUpController = TextEditingController(text: '40');
-  final TextEditingController _moveDownController = TextEditingController(text: '40');
   final TextEditingController _waitUpController = TextEditingController(text: '5');
   final TextEditingController _waitDownController = TextEditingController(text: '5');
   final TextEditingController _waitEveryController = TextEditingController(text: '1');
 
-  double cyclesCompleted = 0.0;
-  Timer? _idleTimer;
-  String _currentPhase = 'idle';
+  int cyclesCompleted = 0;
+  int _currentCycleIndex = 0;
+  String _currentPhase = 'idle'; // idle, reading, up, waitTop, down, waitBottom, paused, finished
   int _timeLeftSeconds = 0;
+  String _statusMessage = 'Connect and start test';
 
   DateTime? _testStartTime;
+  Timer? _idleTimer;
+  Timer? _livePositionTimer;
+  String _rxBuffer = '';
+
+  // Expert Mode used a simple auto-refresh loop: enter register, toggle auto,
+  // then keep reading that exact register while the motor moves.
+  // We use the same idea here for CurrHeight.
+  static const int _currentHeightRegister = 11503;
+
+  // Hidden internal safety values. They are not user inputs.
+  static const int _toleranceMm = 5;
+  static const Duration _movementTimeout = Duration(seconds: 180);
+  static const Duration _movementCommandInterval = Duration(milliseconds: 980);
+  static const Duration _positionPollInterval = Duration(milliseconds: 400);
 
   @override
   void initState() {
@@ -84,18 +101,25 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _initForegroundTask();
 
+    ble.onDataReceived = _handleBleData;
+
     ble.onConnectionStateChanged = (bool connected) {
       if (!mounted) return;
       setState(() => isConnected = connected);
+
       if (!connected) {
         _stopIdleTimer();
+        _stopLivePositionPolling();
         if (_testRunning && !_testPaused) {
           _testPaused = true;
+          _currentPhase = 'paused';
           _saveSession();
           setState(() {});
         }
       } else {
         _startIdleTimer();
+        _startLivePositionPolling();
+        _readInitialRegisters();
       }
     };
   }
@@ -136,12 +160,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _cyclesController.dispose();
-    _moveUpController.dispose();
-    _moveDownController.dispose();
     _waitUpController.dispose();
     _waitDownController.dispose();
     _waitEveryController.dispose();
     _idleTimer?.cancel();
+    _livePositionTimer?.cancel();
     super.dispose();
   }
 
@@ -150,15 +173,61 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     super.didChangeAppLifecycleState(state);
     if (state == AppLifecycleState.resumed) {
       ble.isActuallyConnected.then((connected) {
-        if (mounted) setState(() => isConnected = connected);
-        if (connected && _idleTimer == null) _startIdleTimer();
+        if (!mounted) return;
+        setState(() => isConnected = connected);
+        if (connected) {
+          if (_idleTimer == null) _startIdleTimer();
+          if (_livePositionTimer == null) _startLivePositionPolling();
+          _readInitialRegisters();
+        }
       });
     }
   }
 
+  void _handleBleData(String msg) {
+    // BLE notifications can arrive as full lines or as partial fragments.
+    // Buffer them so the UI is updated from the newest complete register value.
+    _rxBuffer += msg;
+
+    final lines = _rxBuffer.split(RegExp(r'[\r\n]+'));
+    final endsWithLineBreak = _rxBuffer.endsWith('\n') || _rxBuffer.endsWith('\r');
+    if (endsWithLineBreak) {
+      _rxBuffer = '';
+    } else {
+      _rxBuffer = lines.isNotEmpty ? lines.removeLast() : '';
+    }
+
+    bool changed = false;
+
+    for (final rawLine in lines) {
+      final line = rawLine.trim();
+      if (line.isEmpty) continue;
+
+      final match = RegExp(r'#?R?(\d+)\s*=\s*(-?\d+)').firstMatch(line);
+      if (match == null) continue;
+
+      final register = int.tryParse(match.group(1) ?? '');
+      final value = int.tryParse(match.group(2) ?? '');
+      if (register == null || value == null) continue;
+
+      if (register == _currentHeightRegister) {
+        currentHeight = value;
+        changed = true;
+      } else if (register == 20024) {
+        minHeight = value;
+        changed = true;
+      } else if (register == 20025) {
+        maxHeight = value;
+        changed = true;
+      }
+    }
+
+    if (changed && mounted) setState(() {});
+  }
+
   void _startIdleTimer() {
     _idleTimer?.cancel();
-    _idleTimer = Timer.periodic(const Duration(milliseconds: 380), (t) {
+    _idleTimer = Timer.periodic(const Duration(seconds: 4), (t) {
       if ((!_testRunning || _testPaused) && isConnected && !_isPressed) {
         ble.sendCommand(Commands.idle);
       }
@@ -170,198 +239,391 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     _idleTimer = null;
   }
 
-  void _setValues() {
-    final cycles = int.tryParse(_cyclesController.text);
-    final mUp = int.tryParse(_moveUpController.text);
-    final mDown = int.tryParse(_moveDownController.text);
-    final wUp = int.tryParse(_waitUpController.text);
-    final wDown = int.tryParse(_waitDownController.text);
-    final every = int.tryParse(_waitEveryController.text);
-
-    if (cycles != null && cycles > 0) _cycles = cycles;
-    if (mUp != null && mUp > 0) _moveUpSeconds = mUp;
-    if (mDown != null && mDown > 0) _moveDownSeconds = mDown;
-    if (wUp != null && wUp >= 0) _waitUpSeconds = wUp;
-    if (wDown != null && wDown >= 0) _waitDownSeconds = wDown;
-    if (every != null && every > 0) _waitEvery = every;
-    setState(() {});
+  void _startLivePositionPolling() {
+    _livePositionTimer?.cancel();
+    _livePositionTimer = Timer.periodic(_positionPollInterval, (t) {
+      if (isConnected && !_readingInitialRegisters) {
+        // Same concept as Expert Mode Auto: keep reading the selected register
+        // continuously, even while the motor is moving. Movement commands are
+        // sent separately and much less often.
+        ble.sendCommand(Commands.readCurrentPosition);
+      }
+    });
   }
 
-  Future<void> _runMove({required bool goingUp}) async {
-    final totalMs = (goingUp ? _moveUpSeconds : _moveDownSeconds) * 1000;
-    _currentPhase = goingUp ? 'Opening' : 'Closing';
-    setState(() {});
-    final start = DateTime.now();
-    DateTime lastSent = DateTime.fromMillisecondsSinceEpoch(0);
-    const sendInterval = Duration(milliseconds: 700);
-    while (_testRunning && !_testPaused) {
-      final elapsedMs = DateTime.now().difference(start).inMilliseconds;
-      if (elapsedMs >= totalMs) break;
-
-      final remaining = ((totalMs - elapsedMs) / 1000).ceil();
-      if (remaining != _timeLeftSeconds) setState(() => _timeLeftSeconds = remaining);
-
-      if (DateTime.now().difference(lastSent) >= sendInterval) {
-        await ble.sendCommand(goingUp ? Commands.up : Commands.down);
-        lastSent = DateTime.now();
-      }
-      await Future.delayed(const Duration(milliseconds: 100));
-    }
-    await ble.sendCommand(Commands.idle);
+  void _stopLivePositionPolling() {
+    _livePositionTimer?.cancel();
+    _livePositionTimer = null;
   }
 
-  Future<void> _runWait({required bool atTop}) async {
-    final totalMs = (atTop ? _waitUpSeconds : _waitDownSeconds) * 1000;
-    _currentPhase = atTop ? 'Waiting Top' : 'Waiting Bottom';
-    setState(() {});
-    await ble.sendCommand(Commands.idle);
-    final start = DateTime.now();
-    DateTime lastPing = DateTime.now().subtract(const Duration(seconds: 2));
-    while (_testRunning && !_testPaused) {
-      final elapsedMs = DateTime.now().difference(start).inMilliseconds;
-      if (elapsedMs >= totalMs) break;
+  Future<void> _readInitialRegisters() async {
+    if (!isConnected || _readingInitialRegisters) return;
 
-      final remaining = ((totalMs - elapsedMs) / 1000).ceil();
-      if (remaining != _timeLeftSeconds) setState(() => _timeLeftSeconds = remaining);
+    setState(() {
+      _readingInitialRegisters = true;
+      _currentPhase = _testRunning ? _currentPhase : 'reading';
+      _statusMessage = 'Reading current, min and max position...';
+    });
 
-      if (DateTime.now().difference(lastPing) >= const Duration(seconds: 2)) {
-        await ble.sendCommand(Commands.idle);
-        lastPing = DateTime.now();
-      }
-      await Future.delayed(const Duration(milliseconds: 100));
+    // Expert Mode pauses keep-alive during a manual register refresh. Do the
+    // same here so the three reads are not delayed behind idle/keepalive writes.
+    ble.pauseKeepAlive();
+    try {
+      await ble.sendCommand(Commands.readCurrentPosition);
+      await Future.delayed(const Duration(milliseconds: 120));
+      await ble.sendCommand(Commands.readMinPosition);
+      await Future.delayed(const Duration(milliseconds: 120));
+      await ble.sendCommand(Commands.readMaxPosition);
+      await Future.delayed(const Duration(milliseconds: 250));
+    } finally {
+      ble.resumeKeepAlive();
     }
+
+    if (!mounted) return;
+    setState(() {
+      _readingInitialRegisters = false;
+      if (!_testRunning) _currentPhase = 'idle';
+      _statusMessage = 'Ready';
+    });
+  }
+
+  bool _setValuesFromInput() {
+    final cycles = int.tryParse(_cyclesController.text.trim());
+    final waitUp = int.tryParse(_waitUpController.text.trim());
+    final waitDown = int.tryParse(_waitDownController.text.trim());
+    final waitEvery = int.tryParse(_waitEveryController.text.trim());
+
+    if (cycles == null || cycles <= 0) {
+      _showMessage('Please enter a valid cycle count.');
+      return false;
+    }
+
+    if (waitUp == null || waitUp < 0) {
+      _showMessage('Please enter a valid Pause UP time.');
+      return false;
+    }
+
+    if (waitDown == null || waitDown < 0) {
+      _showMessage('Please enter a valid Pause DOWN time.');
+      return false;
+    }
+
+    if (waitEvery == null || waitEvery <= 0) {
+      _showMessage('Please enter a valid Wait every value.');
+      return false;
+    }
+
+    _cycles = cycles;
+    _waitUpSeconds = waitUp;
+    _waitDownSeconds = waitDown;
+    _waitEvery = waitEvery;
+    setState(() {});
+    return true;
+  }
+
+  bool _controllerLimitsReady() {
+    if (minHeight == null || maxHeight == null) {
+      _showMessage('Min/Max not read yet. Connect and wait for values.');
+      return false;
+    }
+
+    if (maxHeight! <= minHeight!) {
+      _showMessage('Invalid limits: MaxHeight must be greater than MinHeight.');
+      return false;
+    }
+
+    return true;
+  }
+
+  Future<bool> _moveToLimit({required bool goingUp}) async {
+    if (!isConnected || !_controllerLimitsReady()) return false;
+
+    final target = goingUp ? maxHeight! : minHeight!;
+    final command = goingUp ? Commands.up : Commands.down;
+    final phase = goingUp ? 'up' : 'down';
+    final text = goingUp ? 'Opening to MaxHeight' : 'Closing to MinHeight';
+
+    setState(() {
+      _currentPhase = phase;
+      _timeLeftSeconds = 0;
+      _statusMessage = text;
+    });
+
+    final startedAt = DateTime.now();
+    Timer? movementTimer;
+
+    // IMPORTANT:
+    // BluetoothHelper has its own keep-alive timer that sends #CMD idle 0.
+    // During automatic UP/DOWN movement we must pause it, otherwise it can
+    // interrupt the motor every few seconds and create move-stop-move behavior.
+    ble.pauseKeepAlive();
+
+    try {
+      // Same idea as Expert Mode: send the movement command as a continuous
+      // hold stream. The live height polling timer runs independently and keeps
+      // reading #GR=11503 every ~400 ms.
+      await ble.sendCommand(command);
+      movementTimer = Timer.periodic(_movementCommandInterval, (_) {
+        if (_testRunning && !_testPaused && isConnected) {
+          ble.sendCommand(command);
+        }
+      });
+
+      while (_testRunning && !_testPaused) {
+        if (currentHeight != null) {
+          final reached = goingUp
+              ? currentHeight! >= target - _toleranceMm
+              : currentHeight! <= target + _toleranceMm;
+
+          if (reached) {
+            setState(() {
+              _statusMessage = goingUp
+                  ? 'MaxHeight reached: ${currentHeight!} mm'
+                  : 'MinHeight reached: ${currentHeight!} mm';
+            });
+            return true;
+          }
+        }
+
+        final elapsed = DateTime.now().difference(startedAt);
+        if (elapsed >= _movementTimeout) {
+          setState(() {
+            _testPaused = true;
+            _currentPhase = 'paused';
+            _statusMessage = 'Paused: target not reached within safety time.';
+          });
+          return false;
+        }
+
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
+
+      return false;
+    } finally {
+      movementTimer?.cancel();
+      await ble.sendCommand(Commands.idle);
+
+      // Do not resume helper keep-alive while the automatic test continues.
+      // Wait phases send idle intentionally. Keep-alive is resumed only when
+      // the test is paused, stopped, or finished.
+      if (!_testRunning || _testPaused) {
+        ble.resumeKeepAlive();
+        _startIdleTimer();
+      }
+    }
+  }
+
+  Future<bool> _waitAtLimit({required bool atTop}) async {
+    final seconds = atTop ? _waitUpSeconds : _waitDownSeconds;
+    setState(() {
+      _currentPhase = atTop ? 'waitTop' : 'waitBottom';
+      _statusMessage = atTop ? 'Waiting at MaxHeight' : 'Waiting at MinHeight';
+    });
+
+    await ble.sendCommand(Commands.idle);
+
+    for (int remaining = seconds; remaining > 0; remaining--) {
+      if (!_testRunning || _testPaused) return false;
+      setState(() => _timeLeftSeconds = remaining);
+      await ble.sendCommand(Commands.idle);
+      await Future.delayed(const Duration(seconds: 1));
+    }
+
+    if (!mounted) return false;
+    setState(() => _timeLeftSeconds = 0);
+    return true;
+  }
+
+  Future<bool> _settleAtBottomWhenSkippingWait() async {
+    setState(() {
+      _currentPhase = 'settling';
+      _statusMessage = 'Settling at MinHeight';
+    });
+
+    await ble.sendCommand(Commands.idle);
+
+    for (int remaining = 2; remaining > 0; remaining--) {
+      if (!_testRunning || _testPaused) return false;
+      setState(() => _timeLeftSeconds = remaining);
+      await ble.sendCommand(Commands.idle);
+      await Future.delayed(const Duration(seconds: 1));
+    }
+
+    if (!mounted) return false;
+    setState(() => _timeLeftSeconds = 0);
+    return true;
   }
 
   Future<void> _saveSession() async {
     if (_testStartTime == null) return;
-    
+
     final session = TestSession(
       umbrellaName: ble.connectedDeviceName,
       totalCycles: _cycles,
-      completedCycles: cyclesCompleted.toInt(),
+      completedCycles: cyclesCompleted,
       startTime: _testStartTime!,
       endTime: DateTime.now(),
     );
-    
+
     await TestSession.saveOrUpdateSession(session);
   }
 
   Future<void> _startTest() async {
     if (!isConnected) return;
+
+    if (_testRunning && !_testPaused) return;
+
     if (_testRunning && _testPaused) {
       _testPaused = false;
       _stopIdleTimer();
-      setState(() {});
-    } else if (_testRunning && !_testPaused) {
-      return;
+      ble.pauseKeepAlive();
+      setState(() {
+        _statusMessage = 'Resuming test';
+      });
     } else {
-      _setValues();
-      cyclesCompleted = 0.0;
-      _currentPhase = 'Starting';
+      if (!_setValuesFromInput()) return;
+      await _readInitialRegisters();
+      if (!_controllerLimitsReady()) return;
+
+      cyclesCompleted = 0;
+      _currentCycleIndex = 0;
+      _currentPhase = 'up';
       _timeLeftSeconds = 0;
       _testRunning = true;
       _testPaused = false;
       _testStartTime = DateTime.now();
       _stopIdleTimer();
+      ble.pauseKeepAlive();
       await _saveSession();
-      setState(() {});
+      setState(() {
+        _statusMessage = 'Test started';
+      });
     }
 
-    // Step-based logic for adaptable cycles (4 quarters per cycle)
-    int totalQuarters = (_cycles * 4).round();
-    int quartersDone = (cyclesCompleted * 4).round();
-
-    while (_testRunning && quartersDone < totalQuarters) {
-      if (_testPaused) { _startIdleTimer(); return; }
-      
-      int part = quartersDone % 4;
-      if (part == 0) {
-        await _runMove(goingUp: true);
-      } else if (part == 1) {
-        await _runWait(atTop: true);
-      } else if (part == 2) {
-        await _runMove(goingUp: false);
-      } else if (part == 3) {
-        // Only wait at bottom if we reached the grouping limit (e.g. wait every 2nd cycle)
-        int currentCycleNum = (quartersDone ~/ 4) + 1;
-        if (currentCycleNum % _waitEvery == 0) {
-          await _runWait(atTop: false);
-        } else {
-          // Mandatory 2s delay for controller stability if skipping full wait
-          _currentPhase = 'Settling';
-          await ble.sendCommand(Commands.idle);
-          for (int i = 2; i > 0; i--) {
-            if (!_testRunning || _testPaused) break;
-            setState(() => _timeLeftSeconds = i);
-            await Future.delayed(const Duration(seconds: 1));
-          }
-        }
+    while (_testRunning && _currentCycleIndex < _cycles) {
+      if (_testPaused) {
+        _startIdleTimer();
+        return;
       }
 
-      if (!_testRunning || _testPaused) break;
-      
-      quartersDone++;
-      cyclesCompleted = quartersDone / 4.0;
-      
-      // Auto-save progress after every completed step
-      await _saveSession();
-      setState(() {});
+      if (_currentPhase == 'up') {
+        final ok = await _moveToLimit(goingUp: true);
+        if (!ok || !_testRunning || _testPaused) break;
+        _currentPhase = 'waitTop';
+      } else if (_currentPhase == 'waitTop') {
+        final ok = await _waitAtLimit(atTop: true);
+        if (!ok || !_testRunning || _testPaused) break;
+        _currentPhase = 'down';
+      } else if (_currentPhase == 'down') {
+        final ok = await _moveToLimit(goingUp: false);
+        if (!ok || !_testRunning || _testPaused) break;
+        _currentPhase = 'waitBottom';
+      } else if (_currentPhase == 'waitBottom') {
+        final currentCycleNum = _currentCycleIndex + 1;
+        final bool shouldDoFullBottomWait = currentCycleNum % _waitEvery == 0;
+
+        final ok = shouldDoFullBottomWait
+            ? await _waitAtLimit(atTop: false)
+            : await _settleAtBottomWhenSkippingWait();
+        if (!ok || !_testRunning || _testPaused) break;
+
+        _currentCycleIndex++;
+        cyclesCompleted = _currentCycleIndex;
+        await _saveSession();
+        setState(() {});
+
+        if (_currentCycleIndex < _cycles) {
+          _currentPhase = 'up';
+        } else {
+          _currentPhase = 'finished';
+        }
+      } else {
+        _currentPhase = 'up';
+      }
     }
 
-    if (_testPaused) { _startIdleTimer(); return; }
-    
+    if (_testPaused) {
+      _startIdleTimer();
+      return;
+    }
+
     if (_testRunning) await _saveSession();
 
     _testRunning = false;
     _testPaused = false;
-    _currentPhase = 'idle';
+    _currentPhase = 'finished';
     _timeLeftSeconds = 0;
-    _testStartTime = null; 
+    _testStartTime = null;
     await ble.sendCommand(Commands.idle);
+    ble.resumeKeepAlive();
     _startIdleTimer();
-    setState(() {});
+    setState(() {
+      _statusMessage = 'Test finished';
+    });
   }
 
   Future<void> _pauseTest() async {
     if (!_testRunning || _testPaused) return;
+
     _testPaused = true;
     await _saveSession();
     await ble.sendCommand(Commands.idle);
+    ble.resumeKeepAlive();
     _startIdleTimer();
-    setState(() {});
+    setState(() {
+      _statusMessage = 'Paused';
+    });
   }
 
   Future<void> _stopTest() async {
     if (_testRunning) await _saveSession();
+
     _testRunning = false;
     _testPaused = false;
     _currentPhase = 'idle';
-    cyclesCompleted = 0.0;
+    _currentCycleIndex = 0;
+    cyclesCompleted = 0;
     _timeLeftSeconds = 0;
     _testStartTime = null;
+
     await ble.sendCommand(Commands.idle);
+    ble.resumeKeepAlive();
     _startIdleTimer();
-    setState(() {});
+    setState(() {
+      _statusMessage = 'Stopped';
+    });
   }
 
   Future<void> _startContinuousCommand(String cmd) async {
     if (!isConnected || (_testRunning && !_testPaused)) return;
-    _isPressed = true;
+
+    setState(() => _isPressed = true);
     _stopIdleTimer();
-    while (_isPressed) {
+    ble.pauseKeepAlive();
+
+    // Same as Expert Mode manual movement: send the command repeatedly while
+    // the button is held. Height polling continues independently.
+    while (_isPressed && isConnected) {
       await ble.sendCommand(cmd);
-      await Future.delayed(const Duration(milliseconds: 700));
+      await Future.delayed(_movementCommandInterval);
     }
+
     await ble.sendCommand(Commands.idle);
-    if (!_testRunning || _testPaused) _startIdleTimer();
+    if (!_testRunning || _testPaused) {
+      ble.resumeKeepAlive();
+      _startIdleTimer();
+    }
   }
 
   void _stopContinuousCommand() {
-    _isPressed = false;
+    setState(() => _isPressed = false);
     ble.emergencyStop(Commands.idle);
-    Future.delayed(const Duration(milliseconds: 50), () {
+    Future.delayed(const Duration(milliseconds: 200), () {
       ble.sendCommand(Commands.idle);
-      if (!_testRunning || _testPaused) _startIdleTimer();
+      if (!_testRunning || _testPaused) {
+        ble.resumeKeepAlive();
+        _startIdleTimer();
+      }
     });
   }
 
@@ -369,8 +631,12 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     if (isConnected) {
       await ble.disconnect();
       _stopIdleTimer();
+      _stopLivePositionPolling();
       await _stopForegroundTask();
-      setState(() => isConnected = false);
+      setState(() {
+        isConnected = false;
+        _statusMessage = 'Disconnected';
+      });
     } else {
       final result = await Navigator.of(context).push(
         MaterialPageRoute(builder: (context) => DeviceSelectionPage(ble: ble)),
@@ -378,17 +644,55 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       if (result == true) {
         await _startForegroundTask();
         final newState = await ble.isActuallyConnected;
-        setState(() => isConnected = newState);
-        if (isConnected) _startIdleTimer();
+        setState(() {
+          isConnected = newState;
+          _statusMessage = newState ? 'Connected' : 'Disconnected';
+        });
+        if (isConnected) {
+          _startIdleTimer();
+          _startLivePositionPolling();
+          await _readInitialRegisters();
+        }
       }
     }
   }
 
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  String _phaseText() {
+    switch (_currentPhase) {
+      case 'reading':
+        return 'Reading';
+      case 'up':
+        return 'Opening';
+      case 'waitTop':
+        return 'Wait Max';
+      case 'down':
+        return 'Closing';
+      case 'waitBottom':
+        return 'Wait Min';
+      case 'settling':
+        return 'Settling';
+      case 'paused':
+        return 'Paused';
+      case 'finished':
+        return 'Finished';
+      default:
+        return 'Idle';
+    }
+  }
+
+  String _heightText(int? value) => value == null ? '_____' : '$value mm';
+
   @override
   Widget build(BuildContext context) {
-    bool controlsEnabled = !_testRunning || _testPaused;
-    bool startEnabled = !_testRunning || _testPaused;
-    bool disconnectEnabled = !_testRunning || _testPaused;
+    final controlsEnabled = !_testRunning || _testPaused;
+    final startEnabled = isConnected && (!_testRunning || _testPaused);
+    final disconnectEnabled = !_testRunning || _testPaused;
+    const labelStyle = TextStyle(fontSize: 16, fontWeight: FontWeight.bold);
 
     return Scaffold(
       backgroundColor: Colors.grey[300],
@@ -418,11 +722,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               leading: const Icon(Icons.history, color: Colors.black54),
               title: const Text('Test History', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
               onTap: () {
-                Navigator.pop(context); 
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => const SessionsPage()),
-                );
+                Navigator.pop(context);
+                Navigator.push(context, MaterialPageRoute(builder: (context) => const SessionsPage()));
               },
             ),
             const ListTile(
@@ -432,122 +733,196 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           ],
         ),
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(5),
-        child: Column(
-          children: [
-            Center(child: Text('LMC Test App', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.grey[600]))),
-            const SizedBox(height: 2),
-            Center(
-              child: Text(
-                isConnected ? 'Status: Connected (${ble.connectedDeviceName})' : 'Status: Disconnected',
-                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: isConnected ? Colors.green : Colors.red),
-              ),
-            ),
-            const SizedBox(height: 5),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Container(
-                  width: 190,
-                  decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(15), boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 5, offset: Offset(0, 3))]),
-                  padding: const EdgeInsets.all(8),
-                  child: Column(
-                    children: [
-                      const Center(child: Text('INPUTS', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.grey))),
-                      const SizedBox(height: 8),
-                      _inputRow('Cycles:', _cyclesController, null),
-                      const SizedBox(height: 6),
-                      _inputRow('Move up:', _moveUpController, 's'),
-                      const SizedBox(height: 6),
-                      _inputRow('Move down:', _moveDownController, 's'),
-                      const SizedBox(height: 6),
-                      _inputRow('Wait up:', _waitUpController, 's'),
-                      const SizedBox(height: 6),
-                      _inputRow('Wait down:', _waitDownController, 's'),
-                      const SizedBox(height: 6),
-                      _inputRow('Wait every:', _waitEveryController, 'cyc'),
-                    ],
-                  ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(5),
+          child: Column(
+            children: [
+              Center(child: Text('LMC Test App', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.grey[600]))),
+              const SizedBox(height: 2),
+              Center(
+                child: Text(
+                  isConnected ? 'Status: Connected (${ble.connectedDeviceName})' : 'Status: Disconnected',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: isConnected ? Colors.green : Colors.red),
                 ),
-                const SizedBox(width: 5),
-                Expanded(
-                  child: Container(
-                    decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))]),
+              ),
+              const SizedBox(height: 5),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    height: 300,
+                    width: 190,
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(15),
+                      boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 5, offset: Offset(0, 3))],
+                    ),
                     padding: const EdgeInsets.all(8),
                     child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text('RESULTS', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.grey)),
+                        const Center(child: Text('INPUTS', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.grey))),
                         const SizedBox(height: 8),
-                        const Text('CYCLES COMPLETED:', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFFE96A1E))),
-                        const SizedBox(height: 4),
-                        Text(cyclesCompleted.toInt().toString(), style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold, color: Colors.green)),
-                        const SizedBox(height: 6),
-                        Text('Phase: $_currentPhase', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-                        const SizedBox(height: 2),
-                        Text('Time left: ${_timeLeftSeconds}s', style: const TextStyle(fontSize: 12, color: Colors.blueGrey, fontWeight: FontWeight.bold)),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 5),
-            Row(
-              children: [
-                AbsorbPointer(
-                  absorbing: !controlsEnabled,
-                  child: Container(
-                    height: 170,
-                    width: 150,
-                    decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))]),
-                    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 3),
-                    child: Column(
-                      children: [
-                        const Text('CONTROLS', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.grey)),
+                        Text('MinHeight: ${_heightText(minHeight)}', style: labelStyle),
                         const SizedBox(height: 5),
-                        Listener(onPointerDown: (_) => _startContinuousCommand(Commands.up), onPointerUp: (_) => _stopContinuousCommand(), onPointerCancel: (_) => _stopContinuousCommand(), child: _controlButton('UP', Icons.arrow_upward, isEnabled: controlsEnabled)),
-                        const SizedBox(height: 10),
-                        Listener(onPointerDown: (_) => _startContinuousCommand(Commands.down), onPointerUp: (_) => _stopContinuousCommand(), onPointerCancel: (_) => _stopContinuousCommand(), child: _controlButton('DOWN', Icons.arrow_downward, isEnabled: controlsEnabled)),
+                        Text('MaxHeight: ${_heightText(maxHeight)}', style: labelStyle),
+                        const SizedBox(height: 5),
+                        Text('CurrHeight: ${_heightText(currentHeight)}', style: labelStyle),
+                        const SizedBox(height: 2),
+                        const Text('Curr source: #GR=11503', style: TextStyle(fontSize: 10, color: Colors.blueGrey)),
+                        const SizedBox(height: 8),
+                        _inputRow('Cycles:', _cyclesController, null),
+                        const SizedBox(height: 5),
+                        _inputRow('Pause UP:', _waitUpController, 's'),
+                        const SizedBox(height: 5),
+                        _inputRow('Pause DOWN:', _waitDownController, 's'),
+                        const SizedBox(height: 5),
+                        _inputRow('Wait every:', _waitEveryController, 'cyc'),
+                        const SizedBox(height: 5),
+                        SizedBox(
+                          height: 30,
+                          width: double.infinity,
+                          child: ElevatedButton.icon(
+                            onPressed: (isConnected && !_testRunning && !_readingInitialRegisters)
+                                ? _readInitialRegisters
+                                : null,
+                            icon: const Icon(Icons.refresh, size: 14),
+                            label: const Text('Read Inputs', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF5B6770),
+                              foregroundColor: Colors.white,
+                              padding: EdgeInsets.zero,
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                            ),
+                          ),
+                        ),
+                        if (_readingInitialRegisters)
+                          const Text('Reading values...', style: TextStyle(fontSize: 11, color: Colors.blueGrey)),
                       ],
                     ),
                   ),
-                ),
-                const SizedBox(width: 15),
-                Column(
-                  children: [
-                    ElevatedButton.icon(
-                      onPressed: startEnabled ? _startTest : null, 
-                      icon: Icon(_testPaused ? Icons.play_arrow : Icons.play_circle_fill), 
-                      label: Text(_testPaused ? 'Resume' : 'Start', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), 
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: startEnabled ? const Color(0xFFE96A1E) : Colors.grey, 
-                        foregroundColor: Colors.white, 
-                        minimumSize: const Size(110, 40), 
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))
-                      )
+                  const SizedBox(width: 5),
+                  Expanded(
+                    child: Container(
+                      height: 300,
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(20),
+                        boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))],
+                      ),
+                      padding: const EdgeInsets.all(8),
+                      child: Column(
+                        children: [
+                          const Text('RESULTS', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.grey)),
+                          const SizedBox(height: 8),
+                          const Text('CYCLES COMPLETED:', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFFE96A1E))),
+                          const SizedBox(height: 4),
+                          Text(cyclesCompleted.toString(), style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold, color: Colors.green)),
+                          const SizedBox(height: 6),
+                          Text('Phase: ${_phaseText()}', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                          const SizedBox(height: 2),
+                          Text(_timeLeftSeconds > 0 ? 'Wait left: ${_timeLeftSeconds}s' : _statusMessage, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, color: Colors.blueGrey, fontWeight: FontWeight.bold)),
+                        ],
+                      ),
                     ),
-                    const SizedBox(height: 10),
-                    ElevatedButton.icon(onPressed: (_testRunning && !_testPaused) ? _pauseTest : null, icon: const Icon(Icons.pause), label: const Text('Pause', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: (_testRunning && !_testPaused) ? Colors.amber : Colors.grey, foregroundColor: Colors.white, minimumSize: const Size(110, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
-                    const SizedBox(height: 10),
-                    ElevatedButton.icon(onPressed: _testRunning ? _stopTest : null, icon: const Icon(Icons.stop), label: const Text('Stop', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)), style: ElevatedButton.styleFrom(backgroundColor: _testRunning ? const Color(0xFFE96A1E) : Colors.grey, foregroundColor: Colors.white, minimumSize: const Size(110, 40), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)))),
-                  ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 5),
+              Row(
+                children: [
+                  AbsorbPointer(
+                    absorbing: !controlsEnabled || !isConnected,
+                    child: Opacity(
+                      opacity: (controlsEnabled && isConnected) ? 1 : 0.45,
+                      child: Container(
+                        height: 170,
+                        width: 150,
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(20),
+                          boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))],
+                        ),
+                        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 3),
+                        child: Column(
+                          children: [
+                            const Text('CONTROLS', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.grey)),
+                            const SizedBox(height: 5),
+                            Listener(
+                              onPointerDown: (_) => _startContinuousCommand(Commands.up),
+                              onPointerUp: (_) => _stopContinuousCommand(),
+                              onPointerCancel: (_) => _stopContinuousCommand(),
+                              child: _controlButton('UP', Icons.arrow_upward, isEnabled: controlsEnabled && isConnected),
+                            ),
+                            const SizedBox(height: 10),
+                            Listener(
+                              onPointerDown: (_) => _startContinuousCommand(Commands.down),
+                              onPointerUp: (_) => _stopContinuousCommand(),
+                              onPointerCancel: (_) => _stopContinuousCommand(),
+                              child: _controlButton('DOWN', Icons.arrow_downward, isEnabled: controlsEnabled && isConnected),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 15),
+                  Column(
+                    children: [
+                      ElevatedButton.icon(
+                        onPressed: startEnabled ? _startTest : null,
+                        icon: Icon(_testPaused ? Icons.play_arrow : Icons.play_circle_fill),
+                        label: Text(_testPaused ? 'Resume' : 'Start', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: startEnabled ? const Color(0xFFE96A1E) : Colors.grey,
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size(110, 40),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      ElevatedButton.icon(
+                        onPressed: (_testRunning && !_testPaused) ? _pauseTest : null,
+                        icon: const Icon(Icons.pause),
+                        label: const Text('Pause', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: (_testRunning && !_testPaused) ? Colors.amber : Colors.grey,
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size(110, 40),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      ElevatedButton.icon(
+                        onPressed: _testRunning ? _stopTest : null,
+                        icon: const Icon(Icons.stop),
+                        label: const Text('Stop', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: _testRunning ? const Color(0xFFE96A1E) : Colors.grey,
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size(110, 40),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton.icon(
+                onPressed: disconnectEnabled ? scanAndConnect : null,
+                icon: Icon(isConnected ? Icons.bluetooth_disabled : Icons.bluetooth),
+                label: Text(isConnected ? 'Disconnect' : 'Connect', style: const TextStyle(fontSize: 20)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: disconnectEnabled ? const Color(0xFFE96A1E) : Colors.grey,
+                  foregroundColor: Colors.white,
+                  minimumSize: const Size(double.infinity, 55),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                 ),
-              ],
-            ),
-            const SizedBox(height: 20),
-            ElevatedButton.icon(
-              onPressed: disconnectEnabled ? scanAndConnect : null, 
-              icon: Icon(isConnected ? Icons.bluetooth_disabled : Icons.bluetooth), 
-              label: Text(isConnected ? 'Disconnect' : 'Connect', style: const TextStyle(fontSize: 20)), 
-              style: ElevatedButton.styleFrom(
-                backgroundColor: disconnectEnabled ? const Color(0xFFE96A1E) : Colors.grey, 
-                foregroundColor: Colors.white, 
-                minimumSize: const Size(double.infinity, 55), 
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))
-              )
-            ),
-          ],
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -556,8 +931,28 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Widget _inputRow(String label, TextEditingController controller, String? suffix) {
     return Row(
       children: [
-        SizedBox(width: 85, child: Text(label, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
-        Expanded(child: SizedBox(height: 28, child: TextField(controller: controller, keyboardType: const TextInputType.numberWithOptions(decimal: false), decoration: InputDecoration(suffixText: suffix, isDense: true, contentPadding: const EdgeInsets.symmetric(horizontal: 6), border: const OutlineInputBorder())))),
+        SizedBox(
+          width: 82,
+          child: Text(
+            label,
+            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+          ),
+        ),
+        Expanded(
+          child: SizedBox(
+            height: 28,
+            child: TextField(
+              controller: controller,
+              keyboardType: const TextInputType.numberWithOptions(decimal: false),
+              decoration: InputDecoration(
+                suffixText: suffix,
+                isDense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 6),
+                border: const OutlineInputBorder(),
+              ),
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -567,11 +962,18 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       alignment: Alignment.center,
       padding: const EdgeInsets.symmetric(vertical: 14),
       decoration: BoxDecoration(
-        color: isEnabled ? const Color(0xFFE96A1E) : Colors.grey, 
-        borderRadius: BorderRadius.circular(6), 
-        boxShadow: isEnabled ? const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))] : null
+        color: isEnabled ? const Color(0xFFE96A1E) : Colors.grey,
+        borderRadius: BorderRadius.circular(6),
+        boxShadow: isEnabled ? const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3))] : null,
       ),
-      child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [Icon(icon, color: Colors.white), const SizedBox(width: 8), Text(label, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold))]),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, color: Colors.white),
+          const SizedBox(width: 8),
+          Text(label, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+        ],
+      ),
     );
   }
 }
