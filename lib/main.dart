@@ -55,7 +55,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   bool _testRunning = false;
   bool _testPaused = false;
   bool _isPressed = false;
-  bool _readingInitialRegisters = false;
 
   // Values read automatically from the controller.
   int? minHeight; // #R20024=
@@ -82,7 +81,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   DateTime? _testStartTime;
   Timer? _idleTimer;
   Timer? _livePositionTimer;
-  String _rxBuffer = '';
 
   // Expert Mode used a simple auto-refresh loop: enter register, toggle auto,
   // then keep reading that exact register while the motor moves.
@@ -184,32 +182,31 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     }
   }
 
+  // Persistent fragment buffer — BLE packets can split mid-line.
+  String _rxBuf = '';
+
   void _handleBleData(String msg) {
-    // BLE notifications can arrive as full lines or as partial fragments.
-    // Buffer them so the UI is updated from the newest complete register value.
-    _rxBuffer += msg;
+    _rxBuf += msg;
 
-    final lines = _rxBuffer.split(RegExp(r'[\r\n]+'));
-    final endsWithLineBreak = _rxBuffer.endsWith('\n') || _rxBuffer.endsWith('\r');
-    if (endsWithLineBreak) {
-      _rxBuffer = '';
-    } else {
-      _rxBuffer = lines.isNotEmpty ? lines.removeLast() : '';
-    }
+    // Process every complete line; keep the last incomplete fragment.
+    while (true) {
+      final nlIdx = _rxBuf.indexOf(RegExp(r'[\r\n]'));
+      if (nlIdx == -1) break;               // no complete line yet
 
-    bool changed = false;
+      final line = _rxBuf.substring(0, nlIdx).trim();
+      _rxBuf = _rxBuf.substring(nlIdx + 1); // consume including the newline
 
-    for (final rawLine in lines) {
-      final line = rawLine.trim();
       if (line.isEmpty) continue;
 
+      // Parse  "#R11503=1234"  or  "R11503=1234"  or  "11503=1234"
       final match = RegExp(r'#?R?(\d+)\s*=\s*(-?\d+)').firstMatch(line);
       if (match == null) continue;
 
       final register = int.tryParse(match.group(1) ?? '');
-      final value = int.tryParse(match.group(2) ?? '');
+      final value    = int.tryParse(match.group(2) ?? '');
       if (register == null || value == null) continue;
 
+      bool changed = false;
       if (register == _currentHeightRegister) {
         currentHeight = value;
         changed = true;
@@ -220,9 +217,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         maxHeight = value;
         changed = true;
       }
+      if (changed && mounted) setState(() {});
     }
-
-    if (changed && mounted) setState(() {});
   }
 
   void _startIdleTimer() {
@@ -242,10 +238,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   void _startLivePositionPolling() {
     _livePositionTimer?.cancel();
     _livePositionTimer = Timer.periodic(_positionPollInterval, (t) {
-      if (isConnected && !_readingInitialRegisters) {
-        // Same concept as Expert Mode Auto: keep reading the selected register
-        // continuously, even while the motor is moving. Movement commands are
-        // sent separately and much less often.
+      // Position poll runs unconditionally whenever connected.
+      // It uses normal priority so any pending motor command (high priority)
+      // always goes first through the serialized write queue.
+      if (isConnected) {
         ble.sendCommand(Commands.readCurrentPosition);
       }
     });
@@ -257,31 +253,28 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   }
 
   Future<void> _readInitialRegisters() async {
-    if (!isConnected || _readingInitialRegisters) return;
-
-    setState(() {
-      _readingInitialRegisters = true;
-      _currentPhase = _testRunning ? _currentPhase : 'reading';
-      _statusMessage = 'Reading current, min and max position...';
-    });
-
-    // Expert Mode pauses keep-alive during a manual register refresh. Do the
-    // same here so the three reads are not delayed behind idle/keepalive writes.
-    ble.pauseKeepAlive();
-    try {
-      await ble.sendCommand(Commands.readCurrentPosition);
-      await Future.delayed(const Duration(milliseconds: 120));
-      await ble.sendCommand(Commands.readMinPosition);
-      await Future.delayed(const Duration(milliseconds: 120));
-      await ble.sendCommand(Commands.readMaxPosition);
-      await Future.delayed(const Duration(milliseconds: 250));
-    } finally {
-      ble.resumeKeepAlive();
-    }
+    if (!isConnected) return;
 
     if (!mounted) return;
     setState(() {
-      _readingInitialRegisters = false;
+      _currentPhase = _testRunning ? _currentPhase : 'reading';
+      _statusMessage = 'Reading min and max position...';
+    });
+
+    // Queue the three register reads through the normal write pipeline.
+    // The position poll timer also fires during this time — that is fine;
+    // all writes are serialized by BluetoothHelper so nothing collides.
+    // We add a small post-queue delay so the UI has time to show the values
+    // before we declare "Ready".
+    await ble.sendCommand(Commands.readCurrentPosition);
+    await ble.sendCommand(Commands.readMinPosition);
+    await ble.sendCommand(Commands.readMaxPosition);
+
+    // Wait long enough for all three responses to come back.
+    await Future.delayed(const Duration(milliseconds: 400));
+
+    if (!mounted) return;
+    setState(() {
       if (!_testRunning) _currentPhase = 'idle';
       _statusMessage = 'Ready';
     });
@@ -362,10 +355,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       // Same idea as Expert Mode: send the movement command as a continuous
       // hold stream. The live height polling timer runs independently and keeps
       // reading #GR=11503 every ~400 ms.
-      await ble.sendCommand(command);
+      await ble.sendCommand(command, highPriority: true);
       movementTimer = Timer.periodic(_movementCommandInterval, (_) {
         if (_testRunning && !_testPaused && isConnected) {
-          ble.sendCommand(command);
+          ble.sendCommand(command, highPriority: true);
         }
       });
 
@@ -604,7 +597,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     // Same as Expert Mode manual movement: send the command repeatedly while
     // the button is held. Height polling continues independently.
     while (_isPressed && isConnected) {
-      await ble.sendCommand(cmd);
+      await ble.sendCommand(cmd, highPriority: true);
       await Future.delayed(_movementCommandInterval);
     }
 
@@ -784,7 +777,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                           height: 30,
                           width: double.infinity,
                           child: ElevatedButton.icon(
-                            onPressed: (isConnected && !_testRunning && !_readingInitialRegisters)
+                            onPressed: (isConnected && !_testRunning )
                                 ? _readInitialRegisters
                                 : null,
                             icon: const Icon(Icons.refresh, size: 14),
@@ -797,8 +790,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                             ),
                           ),
                         ),
-                        if (_readingInitialRegisters)
-                          const Text('Reading values...', style: TextStyle(fontSize: 11, color: Colors.blueGrey)),
                       ],
                     ),
                   ),
