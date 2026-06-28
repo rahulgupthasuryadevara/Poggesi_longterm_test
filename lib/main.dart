@@ -455,6 +455,27 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     ));
   }
 
+  // ── SAFETY CONFIRMATION ───────────────────────────────────────────────────
+  // Shown when the user presses Start (only for a fresh test, not Resume).
+  // The user must tick every checkbox before the dialog's Start button enables.
+  Future<void> _confirmAndStart() async {
+    // If this is a resume (test already running but paused), skip the dialog.
+    if (_testRunning && _testPaused) {
+      _startTest();
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const _SafetyDialog(),
+    );
+
+    if (confirmed == true) {
+      _startTest();
+    }
+  }
+
   Future<void> _startTest() async {
     if (!isConnected) return;
     if (_testRunning && !_testPaused) return;
@@ -827,7 +848,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         ElevatedButton.icon(
-                          onPressed: startEnabled ? _startTest : null,
+                          onPressed: startEnabled ? _confirmAndStart : null,
                           icon: Icon(_testPaused ? Icons.play_arrow : Icons.play_circle_fill, size: s(18)),
                           label: Text(_testPaused ? 'Resume' : 'Start',
                               style: TextStyle(fontSize: s(14), fontWeight: FontWeight.bold)),
@@ -940,6 +961,233 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
           SizedBox(width: s(6)),
           Text(label, style: TextStyle(color: Colors.white, fontSize: s(16), fontWeight: FontWeight.bold)),
         ],
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SAFETY CONFIRMATION DIALOG
+//
+// A scrollable popup shown before a test starts. Lists numbered safety
+// instructions, each with a checkbox. The "START TEST" button stays disabled
+// until ALL checkboxes are ticked. Returns true via Navigator.pop when the
+// user confirms, or false/null if cancelled.
+// ═══════════════════════════════════════════════════════════════════════════
+class _SafetyDialog extends StatefulWidget {
+  const _SafetyDialog();
+
+  @override
+  State<_SafetyDialog> createState() => _SafetyDialogState();
+}
+
+class _SafetyDialogState extends State<_SafetyDialog> {
+  // Each safety instruction the user must acknowledge.
+  final List<String> _instructions = const [
+    'Keep yourself and all personnel clear of the umbrella before and during the test.',
+    'Make sure all cables (power and programming) are properly and securely connected.',
+    'Set up the testing area with barriers and cones around the umbrella, exactly as shown in the image below.',
+    'Ensure there are no obstructions in the umbrella\'s opening and closing path.',
+    'Do not approach or touch the umbrella while the test is running.',
+    'Ketterer is not responsible for any injury, damage, or consequence arising from improper setup or failure to follow these instructions.',
+  ];
+
+  // Tick state for each instruction.
+  late final List<bool> _checked =
+  List<bool>.filled(_instructions.length, false);
+
+  bool get _allChecked => _checked.every((c) => c);
+
+  @override
+  Widget build(BuildContext context) {
+    final sw = MediaQuery.of(context).size.width;
+    double s(double v) => (v * sw / 390).clamp(v * 0.85, v * 1.10);
+
+    return Dialog(
+      backgroundColor: Colors.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      insetPadding: EdgeInsets.symmetric(horizontal: s(16), vertical: s(24)),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.85,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // ── Header ────────────────────────────────────────────────────
+            Container(
+              width: double.infinity,
+              padding: EdgeInsets.all(s(14)),
+              decoration: const BoxDecoration(
+                color: Color(0xFFE96A1E),
+                borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.warning_amber_rounded, color: Colors.white, size: s(26)),
+                  SizedBox(width: s(10)),
+                  Expanded(
+                    child: Text(
+                      'SAFETY INSTRUCTIONS',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: s(17),
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            // ── Scrollable body ───────────────────────────────────────────
+            Flexible(
+              child: SingleChildScrollView(
+                padding: EdgeInsets.all(s(14)),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Please read and confirm each point before starting the test:',
+                      style: TextStyle(
+                        fontSize: s(13),
+                        fontWeight: FontWeight.w600,
+                        color: Colors.grey[700],
+                      ),
+                    ),
+                    SizedBox(height: s(10)),
+
+                    // Numbered checkboxes
+                    ...List.generate(_instructions.length, (i) {
+                      return Padding(
+                        padding: EdgeInsets.only(bottom: s(6)),
+                        child: InkWell(
+                          onTap: () => setState(() => _checked[i] = !_checked[i]),
+                          borderRadius: BorderRadius.circular(8),
+                          child: Container(
+                            padding: EdgeInsets.all(s(8)),
+                            decoration: BoxDecoration(
+                              color: _checked[i]
+                                  ? const Color(0xFFE96A1E).withOpacity(0.08)
+                                  : Colors.grey[100],
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: _checked[i]
+                                    ? const Color(0xFFE96A1E)
+                                    : Colors.grey.shade300,
+                                width: 1,
+                              ),
+                            ),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                SizedBox(
+                                  width: s(22),
+                                  height: s(22),
+                                  child: Checkbox(
+                                    value: _checked[i],
+                                    activeColor: const Color(0xFFE96A1E),
+                                    materialTapTargetSize:
+                                    MaterialTapTargetSize.shrinkWrap,
+                                    onChanged: (v) =>
+                                        setState(() => _checked[i] = v ?? false),
+                                  ),
+                                ),
+                                SizedBox(width: s(10)),
+                                Expanded(
+                                  child: Text(
+                                    '${i + 1}. ${_instructions[i]}',
+                                    style: TextStyle(
+                                      fontSize: s(12.5),
+                                      height: 1.3,
+                                      color: Colors.black87,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    }),
+
+                    SizedBox(height: s(10)),
+
+                    // Safety zone image
+                    Text(
+                      'Required testing area setup:',
+                      style: TextStyle(
+                        fontSize: s(12.5),
+                        fontWeight: FontWeight.bold,
+                        color: Colors.grey[700],
+                      ),
+                    ),
+                    SizedBox(height: s(8)),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(10),
+                      child: Image.asset(
+                        'assets/safety_zone.png',
+                        fit: BoxFit.contain,
+                        errorBuilder: (_, __, ___) => Container(
+                          height: s(120),
+                          alignment: Alignment.center,
+                          color: Colors.grey[200],
+                          child: Text(
+                            'safety_zone.png not found in assets',
+                            style: TextStyle(fontSize: s(11), color: Colors.grey[600]),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // ── Footer buttons ────────────────────────────────────────────
+            Padding(
+              padding: EdgeInsets.all(s(12)),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () => Navigator.of(context).pop(false),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.grey[700],
+                        padding: EdgeInsets.symmetric(vertical: s(12)),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8)),
+                      ),
+                      child: Text('CANCEL',
+                          style: TextStyle(
+                              fontSize: s(13), fontWeight: FontWeight.bold)),
+                    ),
+                  ),
+                  SizedBox(width: s(10)),
+                  Expanded(
+                    child: ElevatedButton(
+                      // Disabled until every box is ticked.
+                      onPressed: _allChecked
+                          ? () => Navigator.of(context).pop(true)
+                          : null,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor:
+                        _allChecked ? const Color(0xFFE96A1E) : Colors.grey,
+                        foregroundColor: Colors.white,
+                        padding: EdgeInsets.symmetric(vertical: s(12)),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8)),
+                      ),
+                      child: Text('START TEST',
+                          style: TextStyle(
+                              fontSize: s(13), fontWeight: FontWeight.bold)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
