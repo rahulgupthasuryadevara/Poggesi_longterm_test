@@ -300,6 +300,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     int      stallRetries   = 0;
     const    maxStallRetries = 3;
     const    stallThreshold  = Duration(seconds: 3); // no movement this long = stalled
+    const    startupGrace    = Duration(seconds: 5); // ignore stall checks for first 5s
 
     ble.pauseKeepAlive();
 
@@ -336,7 +337,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         }
 
         // 2. Progress detection — has the position changed since last check?
-        if (currentHeight != null) {
+        //    Skip entirely during the first few seconds of the phase, because
+        //    the position register takes a moment to start updating. Without
+        //    this grace period the motor would look "frozen" at the very start
+        //    and trigger a false stall.
+        final inStartupGrace =
+            DateTime.now().difference(startedAt) < startupGrace;
+
+        if (!inStartupGrace && currentHeight != null) {
           if (lastPosition == null || currentHeight != lastPosition) {
             // Position moved (or first reading) → reset stall timer
             lastPosition   = currentHeight;
@@ -358,12 +366,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 stallRetries++;
                 setState(() => _statusMessage =
                 'Motor stopped — retry $stallRetries/$maxStallRetries...');
-                // Kick: idle → wait → resend command (manual Pause→Resume trick)
+                // Kick: idle → resend command (manual Pause→Resume trick)
                 await ble.sendCommand(Commands.idle, highPriority: true);
-                await Future.delayed(const Duration(milliseconds: 500));
                 await ble.sendCommand(command, highPriority: true);
-                // Give it a moment, then reset the progress clock so we measure
-                // a fresh window before the next retry.
+                // Gap of 1000ms between retries — gives the motor a moment to
+                // start moving before we check again.
+                await Future.delayed(const Duration(milliseconds: 1000));
+                // Reset the progress clock so the next freeze window measures
+                // fresh from here.
                 lastProgressAt = DateTime.now();
               } else {
                 // 3 kicks, still frozen → assume physical end of travel reached
@@ -374,6 +384,13 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
               }
             }
           }
+        }
+
+        // While still in the startup grace window, keep the stall clock fresh
+        // so the 3-second freeze timer only starts counting once grace ends.
+        if (inStartupGrace) {
+          lastPosition   = currentHeight;
+          lastProgressAt = DateTime.now();
         }
 
         // 3. Final safety backstop
