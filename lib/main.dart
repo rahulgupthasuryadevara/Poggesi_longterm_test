@@ -55,6 +55,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   int? minHeight;
   int? maxHeight;
   int? currentHeight;
+  int? _isMotorMoving; // register 12503: 1 = moving, 0 = stopped
 
   int _cycles = 3;
   int _waitUpSeconds = 5;
@@ -80,7 +81,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   static const int _toleranceMm = 5;
   static const Duration _movementTimeout = Duration(seconds: 180);
   static const Duration _movementCommandInterval = Duration(milliseconds: 980);
-  static const Duration _positionPollInterval = Duration(milliseconds: 400);
+  static const Duration _positionPollInterval = Duration(milliseconds: 500);
 
   @override
   void initState() {
@@ -187,6 +188,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       if (register == null || value == null) continue;
       bool changed = false;
       if (register == _currentHeightRegister) { currentHeight = value; changed = true; }
+      else if (register == 12503) { _isMotorMoving = value; } // internal only, no rebuild
       else if (register == 20024) { minHeight = value; changed = true; }
       else if (register == 20025) { maxHeight = value; changed = true; }
       if (changed && mounted) setState(() {});
@@ -257,40 +259,140 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     return true;
   }
 
+  // ── POSITION-BASED MOVEMENT with STALL RECOVERY ───────────────────────────
+  //
+  // Source of truth = the real position (currentHeight, register 11503).
+  //   • Going UP   → done when currentHeight >= maxHeight - tolerance
+  //   • Going DOWN → done when currentHeight <= minHeight + tolerance
+  //
+  // Stall recovery:
+  //   While moving we watch the position. If it stops changing for ~3s AND the
+  //   target isn't reached, we treat it as a stall (firmware glitch / power
+  //   blip). We "kick" the motor exactly like a manual Pause→Resume does:
+  //   send idle → wait 500ms → resend the up/down command. Up to 3 kicks.
+  //   If the position still won't move after 3 kicks, we assume the motor hit
+  //   the physical end of travel and finish successfully.
+  //
+  //   Register 12503 (_isMotorMoving) is polled as a secondary confirmation.
+  //
+  // The 180s safety timeout remains as the final backstop.
+  // ─────────────────────────────────────────────────────────────────────────
   Future<bool> _moveToLimit({required bool goingUp}) async {
     if (!isConnected || !_controllerLimitsReady()) return false;
+
     final target  = goingUp ? maxHeight! : minHeight!;
     final command = goingUp ? Commands.up : Commands.down;
+    final label   = goingUp ? 'Opening to MaxHeight' : 'Closing to MinHeight';
+
     setState(() {
-      _currentPhase = goingUp ? 'up' : 'down';
+      _currentPhase    = goingUp ? 'up' : 'down';
       _timeLeftSeconds = 0;
-      _statusMessage = goingUp ? 'Opening to MaxHeight' : 'Closing to MinHeight';
+      _statusMessage   = label;
     });
+
     final startedAt = DateTime.now();
     Timer? movementTimer;
+    Timer? motorPollTimer;
+
+    // Stall tracking
+    int?     lastPosition;          // position at the previous progress check
+    DateTime lastProgressAt = DateTime.now();
+    int      stallRetries   = 0;
+    const    maxStallRetries = 3;
+    const    stallThreshold  = Duration(seconds: 3); // no movement this long = stalled
+
     ble.pauseKeepAlive();
+
     try {
+      // Start movement: send once, then keep re-sending every ~1s
       await ble.sendCommand(command, highPriority: true);
       movementTimer = Timer.periodic(_movementCommandInterval, (_) {
-        if (_testRunning && !_testPaused && isConnected) ble.sendCommand(command, highPriority: true);
+        if (_testRunning && !_testPaused && isConnected) {
+          ble.sendCommand(command, highPriority: true);
+        }
       });
+
+      // Secondary check: poll the motor-moving register every 1s
+      motorPollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (_testRunning && !_testPaused && isConnected) {
+          ble.sendCommand(Commands.readMotorMoving);
+        }
+      });
+
       while (_testRunning && !_testPaused) {
+        // 1. Reached target by position? → success
         if (currentHeight != null) {
-          final reached = goingUp ? currentHeight! >= target - _toleranceMm : currentHeight! <= target + _toleranceMm;
+          final reached = goingUp
+              ? currentHeight! >= target - _toleranceMm
+              : currentHeight! <= target + _toleranceMm;
           if (reached) {
-            setState(() { _statusMessage = goingUp ? 'MaxHeight reached: ${currentHeight!} mm' : 'MinHeight reached: ${currentHeight!} mm'; });
+            setState(() {
+              _statusMessage = goingUp
+                  ? 'MaxHeight reached: ${currentHeight!} mm'
+                  : 'MinHeight reached: ${currentHeight!} mm';
+            });
             return true;
           }
         }
+
+        // 2. Progress detection — has the position changed since last check?
+        if (currentHeight != null) {
+          if (lastPosition == null || currentHeight != lastPosition) {
+            // Position moved (or first reading) → reset stall timer
+            lastPosition   = currentHeight;
+            lastProgressAt = DateTime.now();
+            if (stallRetries != 0) {
+              // We had been stalled and now recovered
+              stallRetries = 0;
+              setState(() => _statusMessage = label);
+            }
+          } else {
+            // Position unchanged — check how long it's been frozen.
+            // Both our own position check AND the motor-moving register
+            // agreeing it's stopped makes this a confident stall.
+            final frozenFor = DateTime.now().difference(lastProgressAt);
+            final motorSaysStopped = _isMotorMoving == 0;
+
+            if (frozenFor >= stallThreshold && motorSaysStopped) {
+              if (stallRetries < maxStallRetries) {
+                stallRetries++;
+                setState(() => _statusMessage =
+                'Motor stopped — retry $stallRetries/$maxStallRetries...');
+                // Kick: idle → wait → resend command (manual Pause→Resume trick)
+                await ble.sendCommand(Commands.idle, highPriority: true);
+                await Future.delayed(const Duration(milliseconds: 500));
+                await ble.sendCommand(command, highPriority: true);
+                // Give it a moment, then reset the progress clock so we measure
+                // a fresh window before the next retry.
+                lastProgressAt = DateTime.now();
+              } else {
+                // 3 kicks, still frozen → assume physical end of travel reached
+                setState(() => _statusMessage = goingUp
+                    ? 'Stopped near top after $maxStallRetries retries — end reached.'
+                    : 'Stopped near bottom after $maxStallRetries retries — end reached.');
+                return true;
+              }
+            }
+          }
+        }
+
+        // 3. Final safety backstop
         if (DateTime.now().difference(startedAt) >= _movementTimeout) {
-          setState(() { _testPaused = true; _currentPhase = 'paused'; _statusMessage = 'Paused: target not reached within safety time.'; });
+          setState(() {
+            _testPaused    = true;
+            _currentPhase  = 'paused';
+            _statusMessage = 'Paused: target not reached within safety time.';
+          });
           return false;
         }
-        await Future.delayed(const Duration(milliseconds: 50));
+
+        await Future.delayed(const Duration(milliseconds: 200));
       }
       return false;
     } finally {
       movementTimer?.cancel();
+      motorPollTimer?.cancel();
+      _isMotorMoving = null;
       await ble.sendCommand(Commands.idle);
       if (!_testRunning || _testPaused) { ble.resumeKeepAlive(); _startIdleTimer(); }
     }
