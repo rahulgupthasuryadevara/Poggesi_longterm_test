@@ -78,7 +78,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Timer? _livePositionTimer;
 
   static const int _currentHeightRegister = 11503;
-  static const int _toleranceMm = 5;
+  static const int _toleranceMm = 10;     // target reached tolerance (mm)
+  static const int _moveDetectMm = 10;    // min change to count as 'moved' (mm)
+  int _failedCyclesInRow = 0;             // consecutive failed cycles
   static const Duration _movementTimeout = Duration(seconds: 180);
   static const Duration _movementCommandInterval = Duration(milliseconds: 980);
   static const Duration _positionPollInterval = Duration(milliseconds: 500);
@@ -345,7 +347,13 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             DateTime.now().difference(startedAt) < startupGrace;
 
         if (!inStartupGrace && currentHeight != null) {
-          if (lastPosition == null || currentHeight != lastPosition) {
+          // Count as "moved" only if the position changed by more than the
+          // detection tolerance. Small wobbles (<= _moveDetectMm) are treated
+          // as still frozen, so noisy readings don't hide a real stall.
+          final movedEnough = lastPosition == null ||
+              (currentHeight! - lastPosition!).abs() > _moveDetectMm;
+
+          if (movedEnough) {
             // Position moved (or first reading) → reset stall timer
             lastPosition   = currentHeight;
             lastProgressAt = DateTime.now();
@@ -412,11 +420,27 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 await Future.delayed(const Duration(milliseconds: 1000));
                 lastProgressAt = DateTime.now();
               } else {
-                // 3 kicks, still frozen → assume physical end of travel reached
-                setState(() => _statusMessage = goingUp
-                    ? 'Stopped near top after $maxStallRetries retries — end reached.'
-                    : 'Stopped near bottom after $maxStallRetries retries — end reached.');
-                return true;
+                // 3 kicks done, motor still won't move. Decide if this is the
+                // real end of travel (close to target = OK) or a genuine
+                // failure (far from target = move failed).
+                final pos = currentHeight ?? 0;
+                final reachedTarget = goingUp
+                    ? pos >= target - _toleranceMm
+                    : pos <= target + _toleranceMm;
+
+                if (reachedTarget) {
+                  // Close enough — treat as a normal successful end of travel.
+                  setState(() => _statusMessage = goingUp
+                      ? 'Top reached (end of travel): $pos mm'
+                      : 'Bottom reached (end of travel): $pos mm');
+                  return true;
+                } else {
+                  // Far from target — this move FAILED.
+                  setState(() => _statusMessage = goingUp
+                      ? 'MOVE FAILED — did not reach top ($pos mm)'
+                      : 'MOVE FAILED — did not reach bottom ($pos mm)');
+                  return false;
+                }
               }
             }
           }
@@ -525,36 +549,72 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       await _readInitialRegisters();
       if (!_controllerLimitsReady()) return;
       cyclesCompleted = 0; _currentCycleIndex = 0; _currentPhase = 'up';
+      _failedCyclesInRow = 0;
       _timeLeftSeconds = 0; _testRunning = true; _testPaused = false;
       _testStartTime = DateTime.now();
       _stopIdleTimer(); ble.pauseKeepAlive();
       await _saveSession();
       setState(() { _statusMessage = 'Test started'; });
     }
+    // Tracks whether the CURRENT cycle had any failed move (up or down).
+    bool cycleHadFailure = false;
+
     while (_testRunning && _currentCycleIndex < _cycles) {
       if (_testPaused) { _startIdleTimer(); return; }
+
       if (_currentPhase == 'up') {
         final ok = await _moveToLimit(goingUp: true);
-        if (!ok || !_testRunning || _testPaused) break;
+        // Pause/stop/disconnect → exit. A FAILED move does NOT break; we note
+        // it and carry on so failures can accumulate across cycles.
+        if (!_testRunning || _testPaused) break;
+        if (!ok) cycleHadFailure = true;
         _currentPhase = 'waitTop';
+
       } else if (_currentPhase == 'waitTop') {
         final ok = await _waitAtLimit(atTop: true);
         if (!ok || !_testRunning || _testPaused) break;
         _currentPhase = 'down';
+
       } else if (_currentPhase == 'down') {
         final ok = await _moveToLimit(goingUp: false);
-        if (!ok || !_testRunning || _testPaused) break;
+        if (!_testRunning || _testPaused) break;
+        if (!ok) cycleHadFailure = true;
         _currentPhase = 'waitBottom';
+
       } else if (_currentPhase == 'waitBottom') {
         final ok = (_currentCycleIndex + 1) % _waitEvery == 0
             ? await _waitAtLimit(atTop: false)
             : await _settleAtBottomWhenSkippingWait();
         if (!ok || !_testRunning || _testPaused) break;
+
+        // End of this cycle — update the consecutive-failure counter.
+        if (cycleHadFailure) {
+          _failedCyclesInRow++;
+        } else {
+          _failedCyclesInRow = 0; // a good cycle resets the streak
+        }
+
         _currentCycleIndex++;
         cyclesCompleted = _currentCycleIndex;
         await _saveSession();
         setState(() {});
+
+        // 3 failed cycles in a row → abort the whole test.
+        if (_failedCyclesInRow >= 3) {
+          _testRunning  = false;
+          _testPaused   = false;
+          _currentPhase = 'finished';
+          await ble.sendCommand(Commands.idle);
+          ble.resumeKeepAlive();
+          _startIdleTimer();
+          setState(() => _statusMessage =
+          'TEST FAILED — 3 cycles failed in a row. Please restart.');
+          return;
+        }
+
+        cycleHadFailure = false; // reset for the next cycle
         _currentPhase = _currentCycleIndex < _cycles ? 'up' : 'finished';
+
       } else {
         _currentPhase = 'up';
       }
