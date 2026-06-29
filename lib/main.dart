@@ -31,7 +31,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'LMC Test App',
+      title: 'EnduraTest',
       theme: ThemeData(primarySwatch: Colors.orange),
       home: const MainPage(),
     );
@@ -858,7 +858,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                           Text('Max:  ${_heightText(maxHeight)}',  style: TextStyle(fontSize: s(13), fontWeight: FontWeight.bold)),
                           SizedBox(height: s(3)),
                           Text('Curr: ${_heightText(currentHeight)}', style: TextStyle(fontSize: s(13), fontWeight: FontWeight.bold)),
-                          Text('#GR=11503', style: TextStyle(fontSize: s(9), color: Colors.blueGrey)),
                           SizedBox(height: s(6)),
                           _inputRow('Cycles:',   _cyclesController,    null,  s),
                           SizedBox(height: s(4)),
