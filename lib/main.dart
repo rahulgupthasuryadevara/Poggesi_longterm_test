@@ -83,7 +83,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   int _failedCyclesInRow = 0;             // consecutive failed cycles
   static const Duration _movementTimeout = Duration(seconds: 180);
   static const Duration _movementCommandInterval = Duration(milliseconds: 980);
-  static const Duration _positionPollInterval = Duration(milliseconds: 500);
+  static const Duration _positionPollInterval = Duration(milliseconds: 700); // matched to controller reply rate (avoids stale-reply backlog)
 
   @override
   void initState() {
@@ -166,7 +166,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
         setState(() => isConnected = connected);
         if (connected) {
           if (_idleTimer == null) _startIdleTimer();
-          if (_livePositionTimer == null) _startLivePositionPolling();
+          _startLivePositionPolling();
           _readInitialRegisters();
         }
       });
@@ -189,7 +189,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
       final value    = int.tryParse(match.group(2) ?? '');
       if (register == null || value == null) continue;
       bool changed = false;
-      if (register == _currentHeightRegister) { currentHeight = value; changed = true; }
+      if (register == _currentHeightRegister) {
+        currentHeight = value; changed = true;
+        _onPositionReplyReceived(); // got the reply → send next poll
+      }
       else if (register == 12503) { _isMotorMoving = value; } // internal only, no rebuild
       else if (register == 20024) { minHeight = value; changed = true; }
       else if (register == 20025) { maxHeight = value; changed = true; }
@@ -211,16 +214,56 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     _idleTimer = null;
   }
 
+  // ── REQUEST-RESPONSE POSITION POLLING ─────────────────────────────────────
+  // Instead of firing position reads on a blind timer (which builds a backlog
+  // of stale replies when the controller is slow), we send ONE read, then wait
+  // for its reply before sending the next. This means the display always shows
+  // the freshest value the controller can give, and lag can never accumulate.
+  //
+  // A safety timeout re-issues the read if a reply never comes back, so the
+  // loop can't get permanently stuck on a dropped packet.
+  bool   _livePollRunning   = false;
+  bool   _awaitingPosition  = false;
+  Timer? _positionTimeout;
+
   void _startLivePositionPolling() {
-    _livePositionTimer?.cancel();
-    _livePositionTimer = Timer.periodic(_positionPollInterval, (t) {
-      if (isConnected) ble.sendCommand(Commands.readCurrentPosition);
-    });
+    if (_livePollRunning) return;
+    _livePollRunning = true;
+    _sendPositionPoll();
   }
 
   void _stopLivePositionPolling() {
+    _livePollRunning  = false;
+    _awaitingPosition = false;
+    _positionTimeout?.cancel();
+    _positionTimeout = null;
     _livePositionTimer?.cancel();
     _livePositionTimer = null;
+  }
+
+  void _sendPositionPoll() {
+    if (!_livePollRunning || !isConnected) return;
+    _awaitingPosition = true;
+    ble.sendCommand(Commands.readCurrentPosition, highPriority: true);
+
+    // Safety net: if no reply arrives within 1s, send the next poll anyway.
+    _positionTimeout?.cancel();
+    _positionTimeout = Timer(const Duration(seconds: 1), () {
+      if (_livePollRunning) {
+        _awaitingPosition = false;
+        _sendPositionPoll();
+      }
+    });
+  }
+
+  // Called from _handleBleData the instant a position (11503) reply arrives.
+  void _onPositionReplyReceived() {
+    if (!_livePollRunning) return;
+    _awaitingPosition = false;
+    _positionTimeout?.cancel();
+    // Immediately request the next position. A tiny delay keeps the queue from
+    // being hammered back-to-back and gives motor/idle commands room.
+    Future.delayed(const Duration(milliseconds: 60), _sendPositionPoll);
   }
 
   Future<void> _readInitialRegisters() async {
