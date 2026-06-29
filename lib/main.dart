@@ -356,24 +356,60 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             }
           } else {
             // Position unchanged — check how long it's been frozen.
-            // Both our own position check AND the motor-moving register
-            // agreeing it's stopped makes this a confident stall.
+            // A frozen position is the PRIMARY stall signal and is enough on
+            // its own to trigger a retry. Register 12503 is only an extra hint:
+            // if it explicitly says the motor is MOVING (1), we hold off, in
+            // case the position reading is just lagging. But if 12503 is 0 or
+            // null/unknown, a frozen position still counts as a stall.
             final frozenFor = DateTime.now().difference(lastProgressAt);
-            final motorSaysStopped = _isMotorMoving == 0;
+            final motorSaysMoving = _isMotorMoving == 1;
 
-            if (frozenFor >= stallThreshold && motorSaysStopped) {
+            // DEBUG: watch this in the console to see stall detection working.
+            debugPrint('[STALL CHECK] pos=$currentHeight last=$lastPosition '
+                'frozenForMs=${frozenFor.inMilliseconds} '
+                '12503=$_isMotorMoving retries=$stallRetries');
+
+            if (frozenFor >= stallThreshold && !motorSaysMoving) {
               if (stallRetries < maxStallRetries) {
                 stallRetries++;
                 setState(() => _statusMessage =
                 'Motor stopped — retry $stallRetries/$maxStallRetries...');
-                // Kick: idle → resend command (manual Pause→Resume trick)
+
+                // Kick the motor by REPLICATING a manual Pause -> Resume, which
+                // is known to work. The key is a real GAP of idle between the
+                // stop and the restart — sending idle then move back-to-back is
+                // too fast and the controller ignores the move.
+                //
+                //   1. Stop the periodic move timer so it doesn't fight us.
+                //   2. Send idle and HOLD it for ~1.5s (the "pause").
+                //   3. Send the move command a few times in a row (the "resume"),
+                //      so the controller definitely latches onto it.
+                //   4. Restart the periodic move timer.
+
+                movementTimer?.cancel();
+
+                // 2. Idle hold — this is the settling gap that makes it work.
                 await ble.sendCommand(Commands.idle, highPriority: true);
-                await ble.sendCommand(command, highPriority: true);
-                // Gap of 1000ms between retries — gives the motor a moment to
-                // start moving before we check again.
+                await Future.delayed(const Duration(milliseconds: 800));
+                await ble.sendCommand(Commands.idle, highPriority: true);
+                await Future.delayed(const Duration(milliseconds: 800));
+
+                // 3. Resume — send the move command several times to latch it.
+                for (int k = 0; k < 3; k++) {
+                  if (!_testRunning || _testPaused) break;
+                  await ble.sendCommand(command, highPriority: true);
+                  await Future.delayed(const Duration(milliseconds: 300));
+                }
+
+                // 4. Restart the periodic move stream.
+                movementTimer = Timer.periodic(_movementCommandInterval, (_) {
+                  if (_testRunning && !_testPaused && isConnected) {
+                    ble.sendCommand(command, highPriority: true);
+                  }
+                });
+
+                // Give the motor a moment, then measure a fresh freeze window.
                 await Future.delayed(const Duration(milliseconds: 1000));
-                // Reset the progress clock so the next freeze window measures
-                // fresh from here.
                 lastProgressAt = DateTime.now();
               } else {
                 // 3 kicks, still frozen → assume physical end of travel reached
