@@ -284,16 +284,51 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
     });
   }
 
+  // Input limits — enforced before a test can start.
+  static const int _maxCycles      = 3500; // maximum cycle count
+  static const int _minPauseUp     = 3;    // Pause UP minimum (seconds)
+  static const int _minPauseDown   = 3;    // Pause DOWN minimum (seconds)
+  static const int _minWaitEvery   = 1;    // Every minimum
+  static const int _maxWaitEvery   = 5;    // Every maximum
+
   bool _setValuesFromInput() {
-    final cycles   = int.tryParse(_cyclesController.text.trim());
-    final waitUp   = int.tryParse(_waitUpController.text.trim());
-    final waitDown = int.tryParse(_waitDownController.text.trim());
+    final cycles    = int.tryParse(_cyclesController.text.trim());
+    final waitUp    = int.tryParse(_waitUpController.text.trim());
+    final waitDown  = int.tryParse(_waitDownController.text.trim());
     final waitEvery = int.tryParse(_waitEveryController.text.trim());
-    if (cycles == null || cycles <= 0)   { _showMessage('Please enter a valid cycle count.'); return false; }
-    if (waitUp == null || waitUp < 0)    { _showMessage('Please enter a valid Pause UP time.'); return false; }
-    if (waitDown == null || waitDown < 0){ _showMessage('Please enter a valid Pause DOWN time.'); return false; }
-    if (waitEvery == null || waitEvery <= 0){ _showMessage('Please enter a valid Wait every value.'); return false; }
-    _cycles = cycles; _waitUpSeconds = waitUp; _waitDownSeconds = waitDown; _waitEvery = waitEvery;
+
+    // Cycles: 1 .. 3500
+    if (cycles == null || cycles <= 0) {
+      _showMessage('Please enter a valid cycle count (1 to $_maxCycles).');
+      return false;
+    }
+    if (cycles > _maxCycles) {
+      _showMessage('Cycle count cannot exceed $_maxCycles.');
+      return false;
+    }
+
+    // Pause UP: minimum 3 s
+    if (waitUp == null || waitUp < _minPauseUp) {
+      _showMessage('Pause UP must be at least $_minPauseUp seconds.');
+      return false;
+    }
+
+    // Pause DOWN: minimum 3 s
+    if (waitDown == null || waitDown < _minPauseDown) {
+      _showMessage('Pause DOWN must be at least $_minPauseDown seconds.');
+      return false;
+    }
+
+    // Every: 1 .. 5
+    if (waitEvery == null || waitEvery < _minWaitEvery || waitEvery > _maxWaitEvery) {
+      _showMessage('Wait every must be between $_minWaitEvery and $_maxWaitEvery.');
+      return false;
+    }
+
+    _cycles = cycles;
+    _waitUpSeconds = waitUp;
+    _waitDownSeconds = waitDown;
+    _waitEvery = waitEvery;
     setState(() {});
     return true;
   }
@@ -816,7 +851,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
             children: [
 
               // Title
-              Text('LMC Test App',
+              Text('EnduraTest',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: s(15), fontWeight: FontWeight.bold, color: Colors.grey[600]),
               ),
