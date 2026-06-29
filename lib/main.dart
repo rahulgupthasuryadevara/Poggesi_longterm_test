@@ -78,8 +78,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
   Timer? _livePositionTimer;
 
   static const int _currentHeightRegister = 11503;
-  static const int _toleranceMm = 10;     // target reached tolerance (mm)
-  static const int _moveDetectMm = 10;    // min change to count as 'moved' (mm)
+  static const int _toleranceMm = 40;     // target reached tolerance (mm)
+  static const int _moveDetectMm = 5;    // min change to count as 'moved' (mm)
   int _failedCyclesInRow = 0;             // consecutive failed cycles
   static const Duration _movementTimeout = Duration(seconds: 180);
   static const Duration _movementCommandInterval = Duration(milliseconds: 980);
@@ -826,7 +826,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                   Text('Hello',    style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
                   Text('Settings', style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w500)),
                 ],
-              ),
+              )
             ),
             ListTile(
               leading: const Icon(Icons.history, color: Colors.black54),
@@ -835,10 +835,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver {
                 Navigator.pop(context);
                 Navigator.push(context, MaterialPageRoute(builder: (context) => const SessionsPage()));
               },
-            ),
-            const ListTile(
-              leading: Icon(Icons.language, color: Colors.black54),
-              title: Text('Language', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
             ),
           ],
         ),
